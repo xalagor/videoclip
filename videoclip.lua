@@ -70,6 +70,19 @@ local config = {
     --                 %Y = year, %M = months, %D = day, %H = hours (24), %I = hours (12),
     --                 %P = am/pm %N = minutes, %S = seconds
     filename_template = '%n_%s-%e',
+
+    video_codec = '',
+    audio_codec = '',
+    -- Upload destination settings
+    upload_dest = 'litterbox', -- litterbox, catbox, anytype
+    anytype_path = 'C:\\Projects\\Thaumcraft\\apps\\service\\bin\\thaumctl.exe',
+    use_ffmpeg = true,
+    ffmpeg_path = 'ffmpeg',
+    ffmpeg_video_codec = 'libsvtav1',
+    ffmpeg_video_crf = '24',
+    ffmpeg_preset = '5',
+    ffmpeg_audio_codec = 'libopus',
+    ffmpeg_audio_bitrate = '128k',
 }
 
 mpopt.read_options(config, NAME)
@@ -104,27 +117,45 @@ local function force_resolution(width, height, clip_fn, ...)
 end
 
 local function set_encoding_settings()
+    if config.video_codec == '' then
+        if config.video_format == 'mp4' then
+            config.video_codec = p.platform == p.Platform.windows and 'h264_mf' or 'libx264'
+        elseif config.video_format == 'vp9' then
+            config.video_codec = 'libvpx-vp9'
+        else
+            config.video_codec = 'libvpx'
+        end
+    end
+
     if config.video_format == 'mp4' then
-        config.video_codec = 'libx264'
         config.video_extension = '.mp4'
     elseif config.video_format == 'vp9' then
-        config.video_codec = 'libvpx-vp9'
         config.video_extension = '.webm'
     else
-        config.video_codec = 'libvpx'
         config.video_extension = '.webm'
     end
 
+    if config.audio_codec == '' then
+        if config.audio_format == 'aac' then
+            config.audio_codec = 'aac'
+        else
+            config.audio_codec = p.platform == p.Platform.windows and 'opus' or 'libopus'
+        end
+    end
+
     if config.audio_format == 'aac' then
-        config.audio_codec = 'aac'
         config.audio_extension = '.aac'
     else
-        config.audio_codec = 'libopus'
         config.audio_extension = '.opus'
     end
 end
 
 local function validate_config()
+    -- Migration: if legacy litterbox=false and upload_dest is default 'litterbox', switch to catbox
+    if config.litterbox == false and config.upload_dest == 'litterbox' then
+        config.upload_dest = 'catbox'
+    end
+
     if not config.audio_bitrate:match('^%d+[kK]$') then
         config.audio_bitrate = (tonumber(config.audio_bitrate) or 32) .. 'k'
     end
@@ -236,7 +267,9 @@ local function fmt_upload_dest()
     local upload_dest
     if config.custom_upload_command ~= '' then
         upload_dest = 'custom upload'
-    elseif config.litterbox then
+    elseif config.upload_dest == 'anytype' then
+        upload_dest = 'Anytype'
+    elseif config.upload_dest == 'litterbox' then
         upload_dest = 'litterbox.catbox.moe (' .. config.litterbox_expire .. ')'
     else
         upload_dest = 'catbox.moe'
@@ -422,7 +455,7 @@ pref_menu.keybindings = {
         pref_menu:toggle_embed_subtitles()
     end },
     { key = 'x', fn = function()
-        pref_menu:toggle_catbox()
+        pref_menu:cycle_upload_dest()
     end },
     { key = 'z', fn = function()
         pref_menu:cycle_litterbox_expiration()
@@ -548,25 +581,33 @@ function pref_menu:toggle_embed_subtitles()
     self:update()
 end
 
-function pref_menu:toggle_catbox()
-    config['litterbox'] = not config['litterbox']
+function pref_menu:cycle_upload_dest()
+    local dests = { 'litterbox', 'catbox', 'anytype' }
+    local selected = 1
+    for i, dest in ipairs(dests) do
+        if config.upload_dest == dest then
+            selected = i
+            break
+        end
+    end
+    config.upload_dest = dests[selected + 1] or dests[1]
     self:update()
 end
 
 function pref_menu:cycle_litterbox_expiration()
-    if not config['litterbox'] then
+    if config.upload_dest ~= 'litterbox' then
         return
     end
     local expirations = pref_menu.litterbox_expirations
 
     local selected = 1
     for i, expiration in ipairs(expirations) do
-        if config['litterbox_expire'] == expiration then
+        if config.litterbox_expire == expiration then
             selected = i
             break
         end
     end
-    config['litterbox_expire'] = expirations[selected + 1] or expirations[1]
+    config.litterbox_expire = expirations[selected + 1] or expirations[1]
     self:update()
 end
 
@@ -580,12 +621,12 @@ function pref_menu:update()
     osd:tab():item('B: Audio bitrate: '):append(config.audio_bitrate):newline()
     osd:tab():item('m: Mute audio: '):append(mp.get_property("mute")):newline()
     osd:tab():item('e: Embed subtitles: '):append(mp.get_property("sub-visibility")):newline()
-    osd:submenu('Catbox'):newline()
-    osd:tab():item('x: Using: '):append(config.litterbox and 'Litterbox (temporary)' or 'Catbox (permanent)'):newline()
-    if config.litterbox then
+    osd:submenu('Upload Destination'):newline()
+    osd:tab():item('x: Destination: '):append(config.upload_dest):newline()
+    if config.upload_dest == 'litterbox' then
         osd:tab():item('z: Litterbox expires after: '):append(config.litterbox_expire):newline()
     else
-        osd:tab():color("b0b0b0"):text('x: Litterbox expires after: '):append("N/A"):newline()
+        osd:tab():color("b0b0b0"):text('z: Litterbox expires after: '):append("N/A"):newline()
     end
     osd:submenu('Save'):newline()
     osd:tab():item('s: Save preferences'):newline()
