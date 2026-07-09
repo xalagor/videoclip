@@ -60,7 +60,7 @@ this.clipboard = (function()
     if this.platform == this.Platform.windows then
         self.clip_exe = "powershell.exe"
         self.copy = function(text)
-            return h.subprocess({ self.clip_exe, '-command', 'Set-Clipboard -Value ' .. text })
+            return h.subprocess({ self.clip_exe, '-command', 'Set-Clipboard -Value \'' .. text .. '\'' })
         end
     else
         if this.platform == this.Platform.macos then
@@ -94,11 +94,10 @@ this.copy_or_open_url = function(url)
     local cb = this.clipboard.copy(url)
     if cb.status ~= 0 then
         local msg = string.format(
-                "Failed to copy URL to clipboard, trying to open in browser instead. Make sure %s is installed.",
+                "Failed to copy URL to clipboard. Make sure %s is working.",
                 this.clipboard.clip_exe
         )
-        h.notify_error(msg, "warn", 4)
-        this.open(url)
+        h.notify_error(msg, "error", 4)
     else
         h.notify("Done! Copied URL to clipboard.", "info", 2)
     end

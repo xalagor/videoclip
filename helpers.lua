@@ -64,7 +64,7 @@ this.remove_text_in_brackets = function(str)
 end
 
 this.remove_special_characters = function(str)
-    return str:gsub('[%-_]', ' '):gsub('[%c%p]', ''):gsub('%s+', ' ')
+    return str:gsub("[%-_]", ' '):gsub("[\127%c%p']", ""):gsub("%s+", ' ')
 end
 
 this.strip = function(str)
@@ -139,7 +139,7 @@ this.query_user_home_dir = function()
 end
 
 this.clean_forbidden_characters = function(title)
-    return title:gsub('[<>:"/\\|%?%*]+', '.')
+    return title:gsub("[<>:\"/\\|%?%*']+", '.')
 end
 
 this.truncate_utf8_bytes = function(s, max_bytes)
