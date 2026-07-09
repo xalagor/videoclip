@@ -8,6 +8,7 @@ Encoder provides interface for creating audio/video clips.
 local mp = require('mp')
 local h = require('helpers')
 local utils = require('mp.utils')
+local p = require('platform')
 local this = {}
 
 local function toms(timestamp)
@@ -180,7 +181,26 @@ this.create_clip = function(clip_type, on_complete)
         local clip_filename_noext = construct_output_filename_noext()
         if clip_type == 'video' then
             local output_path = this.mk_out_path_video(clip_filename_noext)
-            return output_path, this.mkargs_video(output_path)
+            if this.config.use_ffmpeg then
+                -- For intermediate step, temporarily override codec & quality to visually lossless
+                local old_codec = this.config.video_codec
+                local old_bitrate = this.config.video_bitrate
+                local old_preset = this.config.preset
+
+                this.config.video_codec = (p.platform == p.Platform.windows) and 'h264_mf' or 'libx264'
+                this.config.video_bitrate = '100M'
+                this.config.preset = 'ultrafast'
+
+                local temp_args = this.mkargs_video(output_path .. ".temp.mp4")
+
+                this.config.video_codec = old_codec
+                this.config.video_bitrate = old_bitrate
+                this.config.preset = old_preset
+
+                return output_path, temp_args
+            else
+                return output_path, this.mkargs_video(output_path)
+            end
         else
             local output_path = this.mk_out_path_audio(clip_filename_noext)
             return output_path, this.mkargs_audio(output_path)
@@ -200,9 +220,39 @@ this.create_clip = function(clip_type, on_complete)
         if ret.status ~= 0 or string.match(ret.stdout, "could not open") then
             h.notify_error(string.format("Error: couldn't create clip %s.", output_file_path), "error", 5)
         else
-            h.notify(string.format("Clip saved to %s.", output_file_path), "info", 2)
-            if on_complete then
-                on_complete(output_file_path)
+            if this.config.use_ffmpeg and clip_type == 'video' then
+                h.notify("Compressing clip with AV1...", "info", 9999)
+                local temp_path = output_file_path .. ".temp.mp4"
+                local ffmpeg_args = {
+                    this.config.ffmpeg_path,
+                    '-y',
+                    '-i', temp_path,
+                    '-c:v', this.config.ffmpeg_video_codec,
+                    '-crf', tostring(this.config.ffmpeg_video_crf),
+                    '-preset', tostring(this.config.ffmpeg_preset),
+                    '-c:a', this.config.ffmpeg_audio_codec,
+                    '-b:a', this.config.ffmpeg_audio_bitrate,
+                    output_file_path
+                }
+
+                local ffmpeg_callback = function(_, ffmpeg_ret, _)
+                    os.remove(temp_path)
+                    if ffmpeg_ret.status ~= 0 then
+                        h.notify_error("Error: FFmpeg compression failed.", "error", 5)
+                    else
+                        h.notify(string.format("Clip saved to %s.", output_file_path), "info", 2)
+                        if on_complete then
+                            on_complete(output_file_path)
+                        end
+                    end
+                end
+
+                h.subprocess_async(ffmpeg_args, ffmpeg_callback)
+            else
+                h.notify(string.format("Clip saved to %s.", output_file_path), "info", 2)
+                if on_complete then
+                    on_complete(output_file_path)
+                end
             end
         end
     end
