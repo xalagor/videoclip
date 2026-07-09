@@ -255,11 +255,64 @@ local function upload_to_custom(outfile)
     p.copy_or_open_url(url)
 end
 
-local function upload_video(outfile)
-    if config.custom_upload_command ~= '' then
-        upload_to_custom(outfile)
+local function upload_to_anytype(outfile)
+    h.notify("Uploading to Anytype...", "info", 9999)
+    local cmd = {
+        config.anytype_path,
+        "kb",
+        "upload",
+        outfile,
+        "--link",
+        "--add-to-captures"
+    }
+
+    local r = h.subprocess(cmd)
+    if r.status ~= 0 then
+        h.notify_error("Error: Anytype upload failed. Status: " .. tostring(r.status), "error", 4)
+        mp.msg.error("Anytype upload stderr: " .. (r.stderr or ""))
+        return
+    end
+
+    local link = r.stdout
+    if link then
+        link = h.strip(link)
+    end
+
+    if not link or link == "" or not link:find("anytype://") then
+        h.notify_error("Error: Anytype upload returned invalid link.", "error", 4)
+        mp.msg.error("Anytype upload stdout: " .. (r.stdout or ""))
+        return
+    end
+
+    local cb = p.clipboard.copy(link)
+    if cb.status ~= 0 then
+        h.notify("Uploaded to Anytype!\nFailed to copy link to clipboard.", "warn", 4)
     else
+        h.notify("Uploaded to Anytype!\nLink copied to clipboard.", "info", 4)
+    end
+
+    -- Delete local clip
+    local deleted, err = os.remove(outfile)
+    if not deleted then
+        mp.msg.error("Failed to delete local clip: " .. (err or ""))
+    end
+end
+
+local function upload_video(outfile)
+    if config.upload_dest == 'anytype' then
+        upload_to_anytype(outfile)
+    elseif config.upload_dest == 'custom' or config.custom_upload_command ~= '' then
+        upload_to_custom(outfile)
+    elseif config.upload_dest == 'catbox' then
+        local old_litterbox = config.litterbox
+        config.litterbox = false
         upload_to_catbox(outfile)
+        config.litterbox = old_litterbox
+    else
+        local old_litterbox = config.litterbox
+        config.litterbox = true
+        upload_to_catbox(outfile)
+        config.litterbox = old_litterbox
     end
 end
 
