@@ -21,11 +21,11 @@ local NAME = 'videoclip'
 local mp = require('mp')
 local mpopt = require('mp.options')
 local utils = require('mp.utils')
-local OSD = require('osd_styler')
 local p = require('platform')
 local h = require('helpers')
 local encoder = require('encoder')
 local Timings = require('timings_mgr')
+local cropper = require('cropper')
 
 ------------------------------------------------------------
 -- System-dependent variables
@@ -75,7 +75,10 @@ local config = {
     audio_codec = '',
     -- Upload destination settings
     upload_dest = 'litterbox', -- litterbox, catbox, anytype
-    anytype_path = 'C:\\Projects\\Thaumcraft\\apps\\service\\bin\\thaumctl.exe',
+    anytype_api_url = 'http://127.0.0.1:31009',
+    anytype_api_key = '',
+    anytype_space_id = '',
+    anytype_version = '2025-11-08',
     use_ffmpeg = true,
     ffmpeg_path = 'ffmpeg',
     ffmpeg_video_codec = 'libsvtav1',
@@ -86,8 +89,6 @@ local config = {
 }
 
 mpopt.read_options(config, NAME)
-local main_menu
-local pref_menu
 
 local allowed_presets = {
     ultrafast = true,
@@ -255,35 +256,169 @@ local function upload_to_custom(outfile)
     p.copy_or_open_url(url)
 end
 
-local function upload_to_anytype(outfile)
-    h.notify("Uploading to Anytype...", "info", 9999)
-    local cmd = {
-        config.anytype_path,
-        "kb",
-        "upload",
-        outfile,
-        "--link",
-        "--add-to-captures"
+local function resolve_anytype_config()
+    local api_key = config.anytype_api_key
+    if not api_key or api_key == '' then
+        api_key = os.getenv("ANYTYPE_APP_KEY") or os.getenv("ANYTYPE_API_KEY") or ''
+    end
+    local space_id = config.anytype_space_id
+    if not space_id or space_id == '' then
+        space_id = os.getenv("ANYTYPE_SPACE_ID") or ''
+    end
+    return api_key, space_id
+end
+
+local function upload_to_anytype(file_path, source_url, content_from_id)
+    mp.msg.info(string.format(
+        "upload_to_anytype called: file_path=%s, source_url=%s, content_from_id=%s",
+        file_path, tostring(source_url), tostring(content_from_id)
+    ))
+
+    local api_key, space_id = resolve_anytype_config()
+    if api_key == '' or space_id == '' then
+        h.notify_error("Anytype config missing: set anytype_api_key and anytype_space_id", "error", 4)
+        return
+    end
+
+    h.notify("Uploading to Anytype via REST API...", "info", 9999)
+    local base_url = config.anytype_api_url:gsub("/+$", "")
+    local headers = {
+        "-H", "Authorization: Bearer " .. api_key,
+        "-H", "Anytype-Version: " .. config.anytype_version,
     }
 
-    local r = h.subprocess(cmd)
-    if r.status ~= 0 then
-        h.notify_error("Error: Anytype upload failed. Status: " .. tostring(r.status), "error", 4)
-        mp.msg.error("Anytype upload stderr: " .. (r.stderr or ""))
+    -- Step 1: Upload file to v2 API
+    local upload_url = string.format("%s/v2/spaces/%s/files", base_url, space_id)
+    local upload_cmd = {
+        p.curl_exe, "-s",
+        "-X", "POST",
+        upload_url,
+    }
+    for _, header in ipairs(headers) do
+        table.insert(upload_cmd, header)
+    end
+    table.insert(upload_cmd, "-F")
+    table.insert(upload_cmd, "file=@" .. file_path)
+
+    local upload_r = h.subprocess(upload_cmd)
+    if upload_r.status ~= 0 then
+        h.notify_error("Error: Anytype file upload failed. Status: " .. tostring(upload_r.status), "error", 4)
+        mp.msg.error("Anytype upload stderr: " .. (upload_r.stderr or ""))
         return
     end
 
-    local link = r.stdout
-    if link then
-        link = h.strip(link)
-    end
-
-    if not link or link == "" or not link:find("anytype://") then
-        h.notify_error("Error: Anytype upload returned invalid link.", "error", 4)
-        mp.msg.error("Anytype upload stdout: " .. (r.stdout or ""))
+    local upload_out = upload_r.stdout
+    if not upload_out or upload_out == "" then
+        h.notify_error("Error: Anytype file upload returned empty response.", "error", 4)
         return
     end
 
+    local file_id = upload_out:match('"file_id"%s*:%s*"([^"]+)"')
+        or upload_out:match('"id"%s*:%s*"([^"]+)"')
+    if not file_id then
+        h.notify_error("Error: Anytype file upload returned invalid response.", "error", 4)
+        mp.msg.error("Anytype upload stdout: " .. upload_out)
+        return
+    end
+
+    mp.msg.info("Anytype file uploaded, file_id: " .. file_id)
+
+    -- Step 2: Create Bookmark object with v2 API
+    local objects_url = string.format("%s/v2/spaces/%s/objects", base_url, space_id)
+    local clip_name = h.clean_forbidden_characters(
+        mp.get_property("media-title", "clip")
+    )
+
+    local properties = {}
+    if source_url then
+        properties.source = source_url
+    end
+    if file_id then
+        properties.files = { file_id }
+    end
+
+    local obj_body = utils.format_json({
+        type = "Bookmark",
+        name = clip_name,
+        properties = properties,
+    })
+
+    local create_cmd = {
+        p.curl_exe, "-s",
+        "-X", "POST",
+        objects_url,
+    }
+    for _, header in ipairs(headers) do
+        table.insert(create_cmd, header)
+    end
+    table.insert(create_cmd, "-H")
+    table.insert(create_cmd, "Content-Type: application/json")
+    table.insert(create_cmd, "-d")
+    table.insert(create_cmd, obj_body)
+
+    local create_r = h.subprocess(create_cmd)
+    if create_r.status ~= 0 then
+        h.notify_error("Error: Anytype object creation failed. Status: " .. tostring(create_r.status), "error", 4)
+        mp.msg.error("Anytype object creation stderr: " .. (create_r.stderr or ""))
+        os.remove(file_path)
+        return
+    end
+
+    local create_out = create_r.stdout
+    if not create_out or create_out == "" then
+        h.notify_error("Error: Anytype object creation returned empty response.", "error", 4)
+        os.remove(file_path)
+        return
+    end
+
+    local object_id = create_out:match('"id"%s*:%s*"([^"]+)"')
+        or create_out:match('"object_id"%s*:%s*"([^"]+)"')
+    if not object_id then
+        h.notify_error("Error: Anytype object creation returned invalid response.", "error", 4)
+        mp.msg.error("Anytype object creation stdout: " .. create_out)
+        os.remove(file_path)
+        return
+    end
+
+    mp.msg.info("Anytype Bookmark object created, object_id: " .. object_id)
+
+    -- Step 3: Patch object with Content From relation if provided
+    if content_from_id then
+        local patch_url = string.format("%s/v2/spaces/%s/objects/%s", base_url, space_id, object_id)
+        local patch_body = utils.format_json({
+            ops = {
+                {
+                    op = "set_properties",
+                    set = {
+                        content_from = content_from_id,
+                    },
+                },
+            },
+        })
+
+        local patch_cmd = {
+            p.curl_exe, "-s",
+            "-X", "PATCH",
+            patch_url,
+        }
+        for _, header in ipairs(headers) do
+            table.insert(patch_cmd, header)
+        end
+        table.insert(patch_cmd, "-H")
+        table.insert(patch_cmd, "Content-Type: application/json")
+        table.insert(patch_cmd, "-d")
+        table.insert(patch_cmd, patch_body)
+
+        local patch_r = h.subprocess(patch_cmd)
+        if patch_r.status ~= 0 then
+            mp.msg.warn("Anytype object patch failed (content_from): " .. (patch_r.stderr or ""))
+        else
+            mp.msg.info("Anytype Bookmark patched with content_from: " .. content_from_id)
+        end
+    end
+
+    -- Copy link to clipboard
+    local link = string.format("anytype://object?objectId=%s&spaceId=%s", object_id, space_id)
     local cb = p.clipboard.copy(link)
     if cb.status ~= 0 then
         h.notify("Uploaded to Anytype!\nFailed to copy link to clipboard.", "warn", 4)
@@ -291,16 +426,89 @@ local function upload_to_anytype(outfile)
         h.notify("Uploaded to Anytype!\nLink copied to clipboard.", "info", 4)
     end
 
-    -- Delete local clip
-    local deleted, err = os.remove(outfile)
+    -- Delete local file
+    local deleted, err = os.remove(file_path)
     if not deleted then
-        mp.msg.error("Failed to delete local clip: " .. (err or ""))
+        mp.msg.error("Failed to delete local file: " .. (err or ""))
     end
+end
+
+-- anytype_search: query the Anytype v2 search endpoint for Movie, Series, Game types
+-- Returns parsed results as a list of {id, name, type_key} tables via callback
+local function anytype_search(query, callback)
+    local api_key, space_id = resolve_anytype_config()
+    if api_key == '' or space_id == '' then
+        mp.msg.error("Anytype config missing: cannot search")
+        if callback then callback({}) end
+        return
+    end
+
+    if not query or query == "" then
+        mp.msg.info("Anytype search: empty query, returning all Movie/Series/Game")
+    else
+        mp.msg.info("Anytype search: " .. query)
+    end
+
+    local base_url = config.anytype_api_url:gsub("/+$", "")
+    local search_url = string.format("%s/v2/spaces/%s/search", base_url, space_id)
+
+    local search_body = {
+        fields = { "name", "type" },
+    }
+    if query and query ~= "" then
+        search_body.query = query
+    end
+    -- Type filter: Movie, Series, Game — use compact filter string
+    search_body.filter = 'type IN ("movie", "series", "game")'
+
+    local cmd = {
+        p.curl_exe, "-s",
+        "-X", "POST",
+        search_url,
+        "-H", "Authorization: Bearer " .. api_key,
+        "-H", "Anytype-Version: " .. config.anytype_version,
+        "-H", "Content-Type: application/json",
+        "-d", utils.format_json(search_body),
+    }
+
+    local r = h.subprocess(cmd)
+    if r.status ~= 0 then
+        mp.msg.error("Anytype search failed. Status: " .. tostring(r.status))
+        mp.msg.error("Anytype search stderr: " .. (r.stderr or ""))
+        if callback then callback({}) end
+        return
+    end
+
+    local out = r.stdout
+    if not out or out == "" then
+        mp.msg.error("Anytype search returned empty response.")
+        if callback then callback({}) end
+        return
+    end
+
+    local parsed = utils.parse_json(out)
+    if not parsed or not parsed.data then
+        mp.msg.error("Anytype search: could not parse response. stdout: " .. out)
+        if callback then callback({}) end
+        return
+    end
+
+    local results = {}
+    for _, item in ipairs(parsed.data) do
+        table.insert(results, {
+            id = item.id,
+            name = item.name,
+            type_key = item.type,
+        })
+    end
+
+    mp.msg.info(string.format("Anytype search returned %d results.", #results))
+    if callback then callback(results) end
 end
 
 local function upload_video(outfile)
     if config.upload_dest == 'anytype' then
-        upload_to_anytype(outfile)
+        upload_to_anytype(outfile, nil, nil)
     elseif config.upload_dest == 'custom' or config.custom_upload_command ~= '' then
         upload_to_custom(outfile)
     elseif config.upload_dest == 'catbox' then
@@ -332,366 +540,522 @@ local function fmt_upload_dest()
 end
 
 ------------------------------------------------------------
--- Menu interface
+-- State for async upload flow and uosc menus
 
-local Menu = {}
-Menu.__index = Menu
+local timings = Timings:new()
+local search_menu_active = false
+local pending_upload = {
+    file_path = nil,
+    source_url = nil,
+    content_from_id = nil,
+    encoding_done = false,
+    search_done = false,
+    cancelled = false,
+}
 
-function Menu:new(parent)
-    local o = {
-        parent = parent,
-        overlay = parent and parent.overlay or mp.create_osd_overlay('ass-events'),
-        keybindings = { },
-    }
-    return setmetatable(o, self)
+------------------------------------------------------------
+-- uosc Menu helpers
+
+local function open_uosc_menu(menu_data_json)
+    mp.commandv('script-message-to', 'uosc', 'open-menu', menu_data_json)
 end
 
-function Menu:overlay_draw(text)
-    self.overlay.data = text
-    self.overlay:update()
+local function update_uosc_menu(type, items)
+    local json = utils.format_json({ type = type, items = items })
+    mp.commandv('script-message-to', 'uosc', 'update-menu', json)
 end
 
-function Menu:open()
-    if self.parent then
-        self.parent:close()
-    end
-    for _, val in pairs(self.keybindings) do
-        mp.add_forced_key_binding(val.key, val.key, val.fn)
-    end
-    self:update()
-end
-
-function Menu:close()
-    for _, val in pairs(self.keybindings) do
-        mp.remove_key_binding(val.key)
-    end
-    if self.parent then
-        self.parent:open()
-    else
-        self.overlay:remove()
-    end
-end
-
-function Menu:update()
-    local osd = OSD:new():config(config)
-    osd:append('Dummy menu.'):newline()
-    self:overlay_draw(osd:get_text())
+local function close_uosc_menu()
+    mp.commandv('script-message-to', 'uosc', 'close-menu')
 end
 
 ------------------------------------------------------------
--- Main menu
+-- uosc Main Menu
 
-main_menu = Menu:new()
-main_menu.timings = Timings:new()
+function show_main_menu()
+    local start_str = h.human_readable_time(timings['start'])
+    local end_str = h.human_readable_time(timings['end'])
 
-main_menu.keybindings = {
-    { key = 's', fn = function()
-        main_menu:set_time('start')
-    end },
-    { key = 'e', fn = function()
-        main_menu:set_time('end')
-    end },
-    { key = 'S', fn = function()
-        main_menu:set_time_sub('start')
-    end },
-    { key = 'E', fn = function()
-        main_menu:set_time_sub('end')
-    end },
-    { key = 'r', fn = function()
-        main_menu:reset_timings()
-    end },
-    { key = 'c', fn = function()
-        main_menu:create_clip('video')
-    end },
-    { key = 'C', fn = function()
-        force_resolution(1920, -2, encoder.create_clip, 'video')
-    end },
-    { key = 'a', fn = function()
-        main_menu:create_clip('audio')
-    end },
-    { key = 'x', fn = function()
-        main_menu:create_clip('video', upload_video)
-    end },
-    { key = 'X', fn = function()
-        force_resolution(1920, -2, main_menu.create_clip, 'video', upload_video)
-    end },
-    { key = 'p', fn = function()
-        pref_menu:open()
-    end },
-    { key = 'o', fn = function()
-        p.open('https://streamable.com/')
-    end },
-    { key = 'ESC', fn = function()
-        main_menu:close()
-    end },
-}
+    local items = {
+        { title = "Start: " .. start_str, icon = "play_arrow", value = "script-message vc-set-start" },
+        { title = "End: " .. end_str, icon = "stop", value = "script-message vc-set-end" },
+        { title = "Start (subs)", icon = "play_circle", value = "script-message vc-set-start-sub" },
+        { title = "End (subs)", icon = "stop_circle", value = "script-message vc-set-end-sub" },
+        { title = "Reset Timings", icon = "refresh", value = "script-message vc-reset-timings" },
+        { separator = true },
+    }
 
-function main_menu:set_time(property)
-    self.timings[property] = math.max(0, mp.get_property_number('time-pos'))
-    self:update()
+    if encoder.alive == false then
+        table.insert(items, { title = "Warning: mpv encoder not found in PATH", icon = "warning", selectable = false })
+        table.insert(items, { separator = true })
+    end
+
+    table.insert(items, { title = "Video Clip", icon = "movie", value = "script-message vc-create-clp video" })
+    table.insert(items, { title = "Video Clip (Full HD)", icon = "fullscreen", value = "script-message vc-create-clp video-fullhd" })
+    table.insert(items, { title = "Audio Clip", icon = "music_note", value = "script-message vc-create-clp audio" })
+    table.insert(items, { title = "Screenshot", icon = "camera_alt", value = "script-message vc-screenshot" })
+    table.insert(items, { separator = true })
+
+    table.insert(items, { title = "Select Crop Zone", icon = "crop", value = "script-message vc-start-crop" })
+    table.insert(items, { title = "Clear Crop", icon = "crop_free", value = "script-message vc-clear-crop" })
+    table.insert(items, { separator = true })
+
+    table.insert(items, { title = "Preferences", icon = "tune", value = "script-message vc-show-prefs" })
+    table.insert(items, { title = "Open Streamable.com", icon = "public", value = "script-message vc-open-streamable" })
+    table.insert(items, { title = "Close", icon = "close", value = "script-message vc-close-menu" })
+
+    local menu_data = utils.format_json({
+        type = "vc-main",
+        title = "Videoclip",
+        search_style = "disabled",
+        items = items,
+    })
+
+    open_uosc_menu(menu_data)
 end
 
-function main_menu:set_time_sub(property)
-    local sub_delay = mp.get_property_native("sub-delay")
-    local time_pos = mp.get_property_number(string.format("sub-%s", property))
+------------------------------------------------------------
+-- uosc Search Menu
 
+function show_search_menu()
+    search_menu_active = true
+    pending_upload = {
+        file_path = nil,
+        source_url = nil,
+        content_from_id = nil,
+        encoding_done = false,
+        search_done = false,
+        cancelled = false,
+    }
+
+    local menu_data = utils.format_json({
+        type = "vc-search",
+        title = "Search Media (Movie/Series/Game)",
+        search_style = "palette",
+        on_search = "script-message vc-anytype-search",
+        on_close = "script-message vc-search-cancelled",
+        items = {},
+    })
+
+    open_uosc_menu(menu_data)
+end
+
+------------------------------------------------------------
+-- Script message handlers
+
+mp.register_script_message('vc-set-start', function()
+    timings['start'] = math.max(0, mp.get_property_number('time-pos'))
+    show_main_menu()
+end)
+
+mp.register_script_message('vc-set-end', function()
+    timings['end'] = math.max(0, mp.get_property_number('time-pos'))
+    show_main_menu()
+end)
+
+mp.register_script_message('vc-set-start-sub', function()
+    local sub_delay = mp.get_property_native("sub-delay")
+    local time_pos = mp.get_property_number("sub-start")
     if time_pos == nil then
         h.notify_error("Warning: No subtitles visible.", "warn", 2)
         return
     end
+    timings['start'] = math.max(0, time_pos + sub_delay)
+    show_main_menu()
+end)
 
-    self.timings[property] = math.max(0, time_pos + sub_delay)
-    self:update()
-end
-
-function main_menu:reset_timings()
-    self.timings:reset()
-    self:update()
-end
-
-main_menu.open = function()
-    Menu.open(main_menu)
-end
-
-function main_menu:update()
-    local osd = OSD:new():config(config)
-    if encoder.alive == false then
-        osd:red("Error: "):append("mpv is not found in the PATH."):newline()
+mp.register_script_message('vc-set-end-sub', function()
+    local sub_delay = mp.get_property_native("sub-delay")
+    local time_pos = mp.get_property_number("sub-end")
+    if time_pos == nil then
+        h.notify_error("Warning: No subtitles visible.", "warn", 2)
+        return
     end
-    osd:submenu('Timings '):italics('(+shift use sub timings)'):newline()
-    osd:tab():item('s: '):append('start time '):item(h.human_readable_time(self.timings['start'])):newline()
-    osd:tab():item('e: '):append('end time '):item(h.human_readable_time(self.timings['end'])):newline()
-    osd:tab():item('r: '):append('reset'):newline()
-    osd:submenu('Create clip '):italics('(+shift to force fullHD preset)'):newline()
-    osd:tab():item('c: '):append('video clip'):newline()
-    osd:tab():item('a: '):append('audio clip'):newline()
-    osd:tab():item('x: '):append('video clip to ' .. fmt_upload_dest()):newline()
+    timings['end'] = math.max(0, time_pos + sub_delay)
+    show_main_menu()
+end)
 
-    osd:submenu('Options '):newline()
-    osd:tab():item('p: '):append('Open preferences'):newline()
-    osd:tab():item('o: '):append('Open streamable.com'):newline()
-    osd:tab():item('ESC: '):append('Close'):newline()
+mp.register_script_message('vc-reset-timings', function()
+    timings:reset()
+    show_main_menu()
+end)
 
-    self:overlay_draw(osd:get_text())
+mp.register_script_message('vc-create-clp', function(clip_type)
+    if not timings:validate() then
+        h.notify_error("Wrong timings. Aborting.", "warn", 2)
+        return
+    end
+
+    if clip_type == "video-fullhd" then
+        force_resolution(1920, -2, do_create_clip, "video")
+    else
+        do_create_clip(clip_type)
+    end
+end)
+
+mp.register_script_message('vc-screenshot', function()
+    if config.upload_dest == 'anytype' then
+        encoder.extract_screenshot(on_media_generated)
+        show_search_menu()
+    else
+        encoder.extract_screenshot(function(filepath)
+            h.notify(string.format("Screenshot saved to %s.", filepath), "info", 2)
+        end)
+    end
+end)
+
+mp.register_script_message('vc-start-crop', function()
+    close_uosc_menu()
+    cropper.start()
+end)
+
+mp.register_script_message('vc-clear-crop', function()
+    cropper.clear_crop()
+    show_main_menu()
+end)
+
+mp.register_script_message('vc-show-prefs', function()
+    show_preferences_menu()
+end)
+
+mp.register_script_message('vc-open-streamable', function()
+    p.open('https://streamable.com/')
+end)
+
+mp.register_script_message('vc-close-menu', function()
+    close_uosc_menu()
+end)
+
+mp.register_script_message('vc-main-menu', function()
+    show_main_menu()
+end)
+
+-- Create clip handler: starts encoding and, if destination is Anytype,
+-- opens the search menu for media association
+function do_create_clip(clip_type)
+    if config.upload_dest == 'anytype' then
+        encoder.create_clip(clip_type, on_media_generated)
+        show_search_menu()
+    else
+        encoder.create_clip(clip_type, function(filepath)
+            h.notify(string.format("Clip saved to %s.", filepath), "info", 2)
+        end)
+    end
 end
 
-function main_menu:create_clip(clip_type, on_complete_fn)
-    self:close()
-    encoder.create_clip(clip_type, on_complete_fn)
+-- Called when a clip or screenshot finishes generating
+function on_media_generated(file_path)
+    mp.msg.info("Media generated: " .. file_path)
+    pending_upload.file_path = file_path
+    pending_upload.source_url = encoder.get_youtube_url()
+    pending_upload.encoding_done = true
+    try_complete_upload()
+end
+
+-- Called when a user selects a media object from the search menu
+mp.register_script_message('vc-select-media', function(content_from_id)
+    search_menu_active = false
+    close_uosc_menu()
+
+    pending_upload.search_done = true
+    pending_upload.cancelled = false
+    if content_from_id and content_from_id ~= "" then
+        pending_upload.content_from_id = content_from_id
+        mp.msg.info("Selected content_from_id: " .. content_from_id)
+    end
+    try_complete_upload()
+end)
+
+-- Called when the search menu is closed without an explicit selection (Esc, click outside)
+mp.register_script_message('vc-search-cancelled', function()
+    if not search_menu_active then return end
+    search_menu_active = false
+    pending_upload.search_done = true
+    pending_upload.cancelled = true
+    try_complete_upload()
+end)
+
+-- Search handler: queries Anytype as the user types in the search menu
+mp.register_script_message('vc-anytype-search', function(...)
+    if not search_menu_active then return end
+
+    local args = { ... }
+    -- uosc concatenates params with spaces: "script-message vc-anytype-search <query words...> <menu_id>"
+    -- The last arg is always the menu_id; everything before it is the search query.
+    local query = ""
+    if #args >= 2 then
+        local query_parts = {}
+        for i = 1, #args - 1 do
+            query_parts[i] = args[i]
+        end
+        query = table.concat(query_parts, " ")
+    end
+
+    anytype_search(query, function(results)
+        if not search_menu_active then return end
+
+        local items = {}
+        for _, r in ipairs(results) do
+            table.insert(items, {
+                title = r.name,
+                hint = r.type_key,
+                icon = "movie",
+                value = "script-message vc-select-media " .. r.id,
+            })
+        end
+        if #items == 0 then
+            table.insert(items, {
+                title = "No results found",
+                icon = "search_off",
+                selectable = false,
+            })
+        else
+            table.insert(items, 1, {
+                title = "Cancel (no media)",
+                icon = "close",
+                value = "script-message vc-select-media ",
+            })
+        end
+
+        update_uosc_menu("vc-search", items)
+    end)
+end)
+
+-- Check if both encoding is done and media selection is finalized,
+-- then trigger the Anytype upload (or notify on cancel)
+function try_complete_upload()
+    if pending_upload.cancelled then
+        if pending_upload.encoding_done and pending_upload.file_path then
+            h.notify("Upload cancelled. Clip kept locally: " .. pending_upload.file_path, "warn", 3)
+        end
+        return
+    end
+    if not pending_upload.encoding_done or not pending_upload.search_done then
+        return
+    end
+    if not pending_upload.file_path then
+        return
+    end
+    finish_upload()
+end
+
+function finish_upload()
+    local file_path = pending_upload.file_path
+    local source_url = pending_upload.source_url
+    local content_from_id = pending_upload.content_from_id
+
+    pending_upload = {
+        file_path = nil,
+        source_url = nil,
+        content_from_id = nil,
+        encoding_done = false,
+        search_done = false,
+        cancelled = false,
+    }
+
+    if search_menu_active then
+        close_uosc_menu()
+        search_menu_active = false
+    end
+
+    upload_to_anytype(file_path, source_url, content_from_id)
 end
 
 ------------------------------------------------------------
--- Preferences
+-- Preferences Menu (uosc)
 
-pref_menu = Menu:new(main_menu)
-
-pref_menu.keybindings = {
-    { key = 'f', fn = function()
-        pref_menu:cycle_video_formats()
-    end },
-    { key = 'a', fn = function()
-        pref_menu:cycle_audio_formats()
-    end },
-    { key = 'm', fn = function()
-        pref_menu:toggle_mute_audio()
-    end },
-    { key = 'r', fn = function()
-        pref_menu:cycle_resolutions()
-    end },
-    { key = 'b', fn = function()
-        pref_menu:cycle_video_bitrates()
-    end },
-    { key = 'B', fn = function()
-        pref_menu:cycle_audio_bitrates()
-    end },
-    { key = 'e', fn = function()
-        pref_menu:toggle_embed_subtitles()
-    end },
-    { key = 'x', fn = function()
-        pref_menu:cycle_upload_dest()
-    end },
-    { key = 'z', fn = function()
-        pref_menu:cycle_litterbox_expiration()
-    end },
-    { key = 's', fn = function()
-        pref_menu:save()
-    end },
-    { key = 'c', fn = function()
-    end },
-    { key = 'ESC', fn = function()
-        pref_menu:close()
-    end },
-    { key = 'q', fn = function()
-        pref_menu:close()
-    end },
+local pref_resolutions = {
+    { w = config.video_width, h = config.video_height },
+    { w = -2, h = -2 },
+    { w = -2, h = 240 },
+    { w = -2, h = 360 },
+    { w = -2, h = 480 },
+    { w = -2, h = 720 },
+    { w = -2, h = 1080 },
+    { w = -2, h = 1440 },
+    { w = -2, h = 2160 },
 }
+local pref_resolutions_selected = 1
 
-pref_menu.resolutions = {
-    { w = config.video_width, h = config.video_height, },
-    { w = -2, h = -2, },
-    { w = -2, h = 240, },
-    { w = -2, h = 360, },
-    { w = -2, h = 480, },
-    { w = -2, h = 720, },
-    { w = -2, h = 1080, },
-    { w = -2, h = 1440, },
-    { w = -2, h = 2160, },
-    selected = 1,
-}
-pref_menu.audio_bitrates = {
-    config.audio_bitrate,
-    '32k',
-    '64k',
-    '128k',
-    '192k',
-    '256k',
-    '384k',
-    selected = 1,
-}
-pref_menu.video_bitrates = {
-    config.video_bitrate,
-    '500k',
-    '1M',
-    '2M',
-    '4M',
-    '8M',
-    '16M',
-    selected = 1,
-}
+local pref_audio_bitrates = { config.audio_bitrate, '32k', '64k', '128k', '192k', '256k', '384k' }
+local pref_audio_bitrates_selected = 1
 
-pref_menu.vid_formats = { 'mp4', 'vp9', 'vp8', }
-pref_menu.aud_formats = { 'aac', 'opus', }
-pref_menu.litterbox_expirations = { '1h', '12h', '24h', '72h', }
+local pref_video_bitrates = { config.video_bitrate, '500k', '1M', '2M', '4M', '8M', '16M' }
+local pref_video_bitrates_selected = 1
 
-function pref_menu:get_selected_resolution()
+local pref_vid_formats = { 'mp4', 'vp9', 'vp8' }
+local pref_vid_formats_selected = 1
+
+local pref_aud_formats = { 'aac', 'opus' }
+local pref_aud_formats_selected = 1
+
+local pref_upload_dests = { 'litterbox', 'catbox', 'anytype' }
+local pref_upload_dests_selected = 1
+
+local pref_litterbox_expirations = { '1h', '12h', '24h', '72h' }
+local pref_litterbox_expirations_selected = 1
+
+local function get_selected_resolution_text()
+    local res = pref_resolutions[pref_resolutions_selected]
     return string.format(
-            '%s x %s',
-            config.video_width == -2 and 'auto' or config.video_width,
-            config.video_height == -2 and 'auto' or config.video_height
+        '%s x %s',
+        res.w == -2 and 'auto' or tostring(res.w),
+        res.h == -2 and 'auto' or tostring(res.h)
     )
 end
 
-function pref_menu:cycle_resolutions()
-    self.resolutions.selected = self.resolutions.selected + 1 > #self.resolutions and 1 or self.resolutions.selected + 1
-    local res = self.resolutions[self.resolutions.selected]
+function show_preferences_menu()
+    -- Sync selected indices with current config
+    pref_resolutions_selected = 1
+    for i, res in ipairs(pref_resolutions) do
+        if res.w == config.video_width and res.h == config.video_height then
+            pref_resolutions_selected = i
+            break
+        end
+    end
+
+    pref_vid_formats_selected = 1
+    for i, fmt in ipairs(pref_vid_formats) do
+        if config.video_format == fmt then
+            pref_vid_formats_selected = i
+            break
+        end
+    end
+
+    pref_aud_formats_selected = 1
+    for i, fmt in ipairs(pref_aud_formats) do
+        if config.audio_format == fmt then
+            pref_aud_formats_selected = i
+            break
+        end
+    end
+
+    pref_audio_bitrates_selected = 1
+    for i, br in ipairs(pref_audio_bitrates) do
+        if config.audio_bitrate == br then
+            pref_audio_bitrates_selected = i
+            break
+        end
+    end
+
+    pref_video_bitrates_selected = 1
+    for i, br in ipairs(pref_video_bitrates) do
+        if config.video_bitrate == br then
+            pref_video_bitrates_selected = i
+            break
+        end
+    end
+
+    pref_upload_dests_selected = 1
+    for i, dest in ipairs(pref_upload_dests) do
+        if config.upload_dest == dest then
+            pref_upload_dests_selected = i
+            break
+        end
+    end
+
+    pref_litterbox_expirations_selected = 1
+    for i, exp in ipairs(pref_litterbox_expirations) do
+        if config.litterbox_expire == exp then
+            pref_litterbox_expirations_selected = i
+            break
+        end
+    end
+
+    local items = {}
+
+    table.insert(items, { title = "Video Resolution", hint = get_selected_resolution_text(), icon = "desktop", value = "script-message vc-cycle-resolution" })
+    table.insert(items, { title = "Video Format", hint = config.video_format, icon = "video_library", value = "script-message vc-cycle-video-format" })
+    table.insert(items, { title = "Audio Format", hint = config.audio_format, icon = "audiotrack", value = "script-message vc-cycle-audio-format" })
+    table.insert(items, { title = "Video Bitrate", hint = config.video_bitrate, icon = "speed", value = "script-message vc-cycle-video-bitrate" })
+    table.insert(items, { title = "Audio Bitrate", hint = config.audio_bitrate, icon = "volume_down", value = "script-message vc-cycle-audio-bitrate" })
+    table.insert(items, { title = "Mute Audio", hint = tostring(mp.get_property("mute")), icon = "volume_off", value = "script-message vc-toggle-mute" })
+    table.insert(items, { title = "Embed Subtitles", hint = tostring(mp.get_property("sub-visibility")), icon = "subtitles", value = "script-message vc-toggle-subs" })
+    table.insert(items, { separator = true })
+
+    table.insert(items, { title = "Upload Destination", hint = config.upload_dest, icon = "cloud_upload", value = "script-message vc-cycle-upload-dest" })
+
+    if config.upload_dest == 'litterbox' then
+        table.insert(items, { title = "Litterbox Expiry", hint = config.litterbox_expire, icon = "schedule", value = "script-message vc-cycle-litterbox-expire" })
+    end
+
+    table.insert(items, { separator = true })
+    table.insert(items, { title = "Save Preferences", icon = "save", value = "script-message vc-save-prefs" })
+    table.insert(items, { title = "Back", icon = "arrow_back", value = "script-message vc-main-menu" })
+
+    local menu_data = utils.format_json({
+        type = "vc-prefs",
+        title = "Preferences",
+        search_style = "disabled",
+        items = items,
+    })
+
+    open_uosc_menu(menu_data)
+end
+
+mp.register_script_message('vc-cycle-resolution', function()
+    pref_resolutions_selected = pref_resolutions_selected + 1 > #pref_resolutions and 1 or pref_resolutions_selected + 1
+    local res = pref_resolutions[pref_resolutions_selected]
     config.video_width = res.w
     config.video_height = res.h
-    self:update()
-end
+    show_preferences_menu()
+end)
 
---- Cycle through a list of bitrate presets and update the corresponding config value.
---- @param bitrates_key string key into self (e.g. 'audio_bitrates', 'video_bitrates')
---- @param config_key string key into config (e.g. 'audio_bitrate', 'video_bitrate')
-function pref_menu:cycle_bitrates(bitrates_key, config_key)
-    self[bitrates_key].selected = self[bitrates_key].selected + 1 > #self[bitrates_key] and 1 or self[bitrates_key].selected + 1
-    config[config_key] = self[bitrates_key][self[bitrates_key].selected]
-    self:update()
-end
-
-function pref_menu:cycle_audio_bitrates()
-    self:cycle_bitrates('audio_bitrates', 'audio_bitrate')
-end
-
-function pref_menu:cycle_video_bitrates()
-    self:cycle_bitrates('video_bitrates', 'video_bitrate')
-end
-
-function pref_menu:cycle_formats(config_type)
-    local formats
-    if config_type == 'video_format' then
-        formats = pref_menu.vid_formats
-    else
-        formats = pref_menu.aud_formats
-    end
-
-    local selected = 1
-    for i, format in ipairs(formats) do
-        if config[config_type] == format then
-            selected = i
-            break
-        end
-    end
-    config[config_type] = formats[selected + 1] or formats[1]
+mp.register_script_message('vc-cycle-video-format', function()
+    pref_vid_formats_selected = pref_vid_formats_selected + 1 > #pref_vid_formats and 1 or pref_vid_formats_selected + 1
+    config.video_format = pref_vid_formats[pref_vid_formats_selected]
     set_encoding_settings()
-    self:update()
-end
+    show_preferences_menu()
+end)
 
-function pref_menu:cycle_video_formats()
-    pref_menu:cycle_formats('video_format')
-end
+mp.register_script_message('vc-cycle-audio-format', function()
+    pref_aud_formats_selected = pref_aud_formats_selected + 1 > #pref_aud_formats and 1 or pref_aud_formats_selected + 1
+    config.audio_format = pref_aud_formats[pref_aud_formats_selected]
+    set_encoding_settings()
+    show_preferences_menu()
+end)
 
-function pref_menu:cycle_audio_formats()
-    pref_menu:cycle_formats('audio_format')
-end
+mp.register_script_message('vc-cycle-video-bitrate', function()
+    pref_video_bitrates_selected = pref_video_bitrates_selected + 1 > #pref_video_bitrates and 1 or pref_video_bitrates_selected + 1
+    config.video_bitrate = pref_video_bitrates[pref_video_bitrates_selected]
+    show_preferences_menu()
+end)
 
-function pref_menu:toggle_mute_audio()
+mp.register_script_message('vc-cycle-audio-bitrate', function()
+    pref_audio_bitrates_selected = pref_audio_bitrates_selected + 1 > #pref_audio_bitrates and 1 or pref_audio_bitrates_selected + 1
+    config.audio_bitrate = pref_audio_bitrates[pref_audio_bitrates_selected]
+    show_preferences_menu()
+end)
+
+mp.register_script_message('vc-toggle-mute', function()
     mp.commandv("cycle", "mute")
-    self:update()
-end
+    show_preferences_menu()
+end)
 
-function pref_menu:toggle_embed_subtitles()
+mp.register_script_message('vc-toggle-subs', function()
     mp.commandv("cycle", "sub-visibility")
-    self:update()
-end
+    show_preferences_menu()
+end)
 
-function pref_menu:cycle_upload_dest()
-    local dests = { 'litterbox', 'catbox', 'anytype' }
-    local selected = 1
-    for i, dest in ipairs(dests) do
-        if config.upload_dest == dest then
-            selected = i
-            break
-        end
-    end
-    config.upload_dest = dests[selected + 1] or dests[1]
-    self:update()
-end
+mp.register_script_message('vc-cycle-upload-dest', function()
+    pref_upload_dests_selected = pref_upload_dests_selected + 1 > #pref_upload_dests and 1 or pref_upload_dests_selected + 1
+    config.upload_dest = pref_upload_dests[pref_upload_dests_selected]
+    show_preferences_menu()
+end)
 
-function pref_menu:cycle_litterbox_expiration()
-    if config.upload_dest ~= 'litterbox' then
-        return
-    end
-    local expirations = pref_menu.litterbox_expirations
+mp.register_script_message('vc-cycle-litterbox-expire', function()
+    if config.upload_dest ~= 'litterbox' then return end
+    pref_litterbox_expirations_selected = pref_litterbox_expirations_selected + 1 > #pref_litterbox_expirations and 1 or pref_litterbox_expirations_selected + 1
+    config.litterbox_expire = pref_litterbox_expirations[pref_litterbox_expirations_selected]
+    show_preferences_menu()
+end)
 
-    local selected = 1
-    for i, expiration in ipairs(expirations) do
-        if config.litterbox_expire == expiration then
-            selected = i
-            break
-        end
-    end
-    config.litterbox_expire = expirations[selected + 1] or expirations[1]
-    self:update()
-end
-
-function pref_menu:update()
-    local osd = OSD:new():config(config)
-    osd:submenu('Preferences'):newline()
-    osd:tab():item('r: Video resolution: '):append(self:get_selected_resolution()):newline()
-    osd:tab():item('b: Video bitrate: '):append(config.video_bitrate):newline()
-    osd:tab():item('f: Video format: '):append(config.video_format):newline()
-    osd:tab():item('a: Audio format: '):append(config.audio_format):newline()
-    osd:tab():item('B: Audio bitrate: '):append(config.audio_bitrate):newline()
-    osd:tab():item('m: Mute audio: '):append(mp.get_property("mute")):newline()
-    osd:tab():item('e: Embed subtitles: '):append(mp.get_property("sub-visibility")):newline()
-    osd:submenu('Upload Destination'):newline()
-    osd:tab():item('x: Destination: '):append(config.upload_dest):newline()
-    if config.upload_dest == 'litterbox' then
-        osd:tab():item('z: Litterbox expires after: '):append(config.litterbox_expire):newline()
-    else
-        osd:tab():color("b0b0b0"):text('z: Litterbox expires after: '):append("N/A"):newline()
-    end
-    osd:submenu('Save'):newline()
-    osd:tab():item('s: Save preferences'):newline()
-    self:overlay_draw(osd:get_text())
-end
-
-function pref_menu:save()
+mp.register_script_message('vc-save-prefs', function()
     local function lua_to_mpv(config_value)
         if type(config_value) == 'boolean' then
             return config_value and 'yes' or 'no'
         else
-            return config_value
+            return tostring(config_value)
         end
     end
     local ignore_list = {
@@ -699,6 +1063,7 @@ function pref_menu:save()
         audio_extension = true,
         video_codec = true,
         audio_codec = true,
+        anytype_version = true,
     }
     local mpv_dirpath = string.gsub(mp.get_script_directory(), "scripts[\\/][^\\/]+", "")
     local config_filepath = utils.join_path(utils.join_path(mpv_dirpath, "script-opts"), string.format('%s.conf', NAME))
@@ -715,12 +1080,13 @@ function pref_menu:save()
     else
         h.notify_error(string.format("Couldn't open %s.", config_filepath), "error", 4)
     end
-end
+    show_preferences_menu()
+end)
 
 ------------------------------------------------------------
--- Finally, set an 'entry point' in mpv
+-- Entry point
 
 validate_config()
-encoder.init(config, main_menu.timings)
-mp.add_key_binding('c', 'videoclip-menu-open', main_menu.open)
+encoder.init(config, timings)
+mp.add_key_binding('c', 'videoclip-menu-open', show_main_menu)
 mp.msg.warn("Press 'c' to open the videoclip menu.")

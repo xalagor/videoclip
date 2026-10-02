@@ -88,6 +88,19 @@ this.mk_out_path_video = function(clip_filename_noext)
 end
 
 this.mkargs_video = function(out_clip_path)
+    local crop_arg = nil
+    local vf_table = mp.get_property_native("vf")
+    if vf_table then
+        for _, filter in ipairs(vf_table) do
+            if filter.name == "crop" and filter.params then
+                local p = filter.params
+                if p.w and p.h and p.x and p.y then
+                    crop_arg = table.concat { '--vf-add=crop=', p.w, ':', p.h, ':', p.x, ':', p.y }
+                end
+            end
+        end
+    end
+
     local args = {
         this.player,
         mp.get_property('path'),
@@ -114,22 +127,31 @@ this.mkargs_video = function(out_clip_path)
         table.concat { '--oacopts-add=b=', this.config.audio_bitrate },
         table.concat { '--ovcopts-add=crf=', this.config.video_quality },
         table.concat { '--ovcopts-add=preset=', this.config.preset },
-        table.concat { '--vf-add=scale=', this.config.video_width, ':', this.config.video_height },
-        table.concat { '--ytdl-format=', mp.get_property("ytdl-format") },
-        table.concat { '--o=', out_clip_path },
-        table.concat { '--sid=', mp.get_property("sid") },
-        table.concat { '--secondary-sid=', mp.get_property("secondary-sid") },
-        table.concat { '--sub-delay=', mp.get_property("sub-delay") },
-        table.concat { '--sub-visibility=', mp.get_property("sub-visibility") },
-        table.concat { '--secondary-sub-visibility=', mp.get_property("secondary-sub-visibility") },
-        table.concat { '--sub-back-color=', mp.get_property("sub-back-color") },
     }
+    
+    if crop_arg then
+        table.insert(args, crop_arg)
+    end
+    
+    table.insert(args, table.concat { '--vf-add=scale=', this.config.video_width, ':', this.config.video_height })
+    local ytdl_fmt = mp.get_property("ytdl-format")
+    if ytdl_fmt and ytdl_fmt ~= "" then
+        table.insert(args, table.concat { '--ytdl-format=', ytdl_fmt })
+    end
+    table.insert(args, table.concat { '--o=', out_clip_path })
+    table.insert(args, table.concat { '--sid=', mp.get_property("sid") })
+    table.insert(args, table.concat { '--secondary-sid=', mp.get_property("secondary-sid") })
+    table.insert(args, table.concat { '--sub-delay=', mp.get_property("sub-delay") })
+    table.insert(args, table.concat { '--sub-visibility=', mp.get_property("sub-visibility") })
+    table.insert(args, table.concat { '--secondary-sub-visibility=', mp.get_property("secondary-sub-visibility") })
+    table.insert(args, table.concat { '--sub-back-color=', mp.get_property("sub-back-color") })
+
     if mp.get_property("sub-border-style", nil) ~= nil then
-        table.insert(args, #args, table.concat { '--sub-border-style=', mp.get_property("sub-border-style") })
+        table.insert(args, table.concat { '--sub-border-style=', mp.get_property("sub-border-style") })
     end
 
     if this.config.video_fps ~= 'auto' then
-        table.insert(args, #args, table.concat { '--vf-add=fps=', this.config.video_fps })
+        table.insert(args, table.concat { '--vf-add=fps=', this.config.video_fps })
     end
 
     args = this.append_embed_subs_args(args)
@@ -142,7 +164,7 @@ this.mk_out_path_audio = function(clip_filename_noext)
 end
 
 this.mkargs_audio = function(out_clip_path)
-    return {
+    local args = {
         this.player,
         mp.get_property('path'),
         '--loop-file=no',
@@ -160,9 +182,15 @@ this.mkargs_audio = function(out_clip_path)
         table.concat { '--volume=', mp.get_property('volume') },
         table.concat { '--aid=', mp.get_property("aid") }, -- track number
         table.concat { '--oacopts-add=b=', this.config.audio_bitrate },
-        table.concat { '--ytdl-format=', mp.get_property("ytdl-format") },
         table.concat { '--o=', out_clip_path }
     }
+    
+    local ytdl_fmt = mp.get_property("ytdl-format")
+    if ytdl_fmt and ytdl_fmt ~= "" then
+        table.insert(args, table.concat { '--ytdl-format=', ytdl_fmt })
+    end
+    
+    return args
 end
 
 this.create_clip = function(clip_type, on_complete)
@@ -259,6 +287,66 @@ this.create_clip = function(clip_type, on_complete)
 
     h.subprocess_async(args, process_result)
     this.timings:reset()
+end
+
+this.extract_screenshot = function(on_complete)
+    local screenshot_filename_noext = construct_output_filename_noext()
+    local output_path = utils.join_path(
+        h.expand_path(this.config.video_folder_path),
+        screenshot_filename_noext .. ".png"
+    )
+
+    local output_dir_path = utils.split_path(output_path)
+    local location_info = utils.file_info(output_dir_path)
+    if not location_info or not location_info.is_dir then
+        h.notify_error(string.format("Error: location %s doesn't exist.", output_dir_path), "error", 5)
+        return
+    end
+
+    -- Remove existing screenshot file if present
+    os.remove(output_path)
+
+    -- Capture current frame to the specified file path
+    mp.commandv("screenshot-to-file", output_path, "video")
+
+    -- Verify the file was created
+    local file_info = utils.file_info(output_path)
+    if file_info and file_info.is_file then
+        h.notify(string.format("Screenshot saved to %s.", output_path), "info", 2)
+        if on_complete then
+            on_complete(output_path)
+        end
+    else
+        h.notify_error("Error: failed to capture screenshot.", "error", 5)
+    end
+end
+
+this.get_youtube_url = function(time_pos)
+    local path = mp.get_property("path", "")
+    if path == "" then return nil end
+
+    local video_id = nil
+
+    -- Handle youtu.be short URLs: https://youtu.be/VIDEO_ID?...
+    local short_match = path:match("youtu.be/([%w%-%_]+)")
+    if short_match then
+        video_id = short_match
+    else
+        -- Handle youtube.com/watch?v=VIDEO_ID
+        local long_match = path:match("[?;&]v=([%w%-%_]+)")
+        if long_match then
+            video_id = long_match
+        end
+    end
+
+    if not video_id then return nil end
+
+    local t = time_pos or mp.get_property_number("time-pos")
+    if t and t >= 0 then
+        return string.format("https://youtu.be/%s?t=%s", video_id, toms(t))
+    end
+
+    return string.format("https://youtu.be/%s", video_id)
 end
 
 this.set_encoder_alive = function()
