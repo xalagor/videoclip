@@ -24,7 +24,6 @@ local utils = require('mp.utils')
 local p = require('platform')
 local h = require('helpers')
 local encoder = require('encoder')
-local OSD = require('osd_styler')
 local Timings = require('timings_mgr')
 local cropper = require('cropper')
 
@@ -52,13 +51,11 @@ local config = {
     video_fps = 'auto',
     audio_format = 'opus', -- aac, opus
     audio_bitrate = '32k', -- 32k, 64k, 128k, 256k. aac requires higher bitrates.
-    font_size = 24,
-    -- ASS \an tag of the corner overlay menu. 9 = top right (default, so the card
-    -- does not cover the top-left title/playlist overlay drawn by the mpv UI
-    -- script), 7 = top left (the original placement), 1 = bottom left.
-    -- https://aegisub.org/docs/3.2/ASS_Tags/#\an
+    -- Corner of the video the menu card is anchored to: ASS \an tag.
+    -- 7 = top left, 9 = top right (the default), 1 = bottom left.
+    -- The card sizes, colours and font follow uosc's own configuration, so
+    -- restyling uosc restyles the card. https://aegisub.org/docs/3.2/ASS_Tags/#\an
     osd_align = 9,
-    osd_outline = 1.5,
     clean_filename = true,
     -- Whether to upload to catbox (permanent) or litterbox (temporary)
     litterbox = true,
@@ -472,6 +469,177 @@ local function fmt_upload_dest()
 end
 
 ------------------------------------------------------------
+-- Card styling, matched to uosc
+--
+-- uosc 5.x exposes no API for a caller-supplied corner text layer: its menu is
+-- always a window and this version has no flash-overlay element. What it does
+-- offer is a look, so the card is our own ASS overlay drawn with uosc's own
+-- values -- its font, its menu font-size formula, its palette, its text border.
+-- With `top_bar=no-border` uosc draws its title straight onto the video that
+-- way, and the card sits in the corner next to it.
+
+-- uosc's own defaults for the keys the card cares about. Options overridden on
+-- the command line (`script-opts-uosc=`) are not visible here, but they are rare
+-- and these match uosc's built-in values.
+local uosc_config = {
+    scale = 1,
+    scale_fullscreen = 1.3,
+    font_scale = 1,
+    font_bold = false,
+    text_border = 1.2,
+    menu_item_height = 36,
+    top_bar_size = 40,
+    color = '',
+}
+
+-- uosc.conf is parsed by hand rather than through mp.options: mp.options treats
+-- every key absent from our table as unknown and warns about it, which floods
+-- the log with warnings for all of uosc's other options.
+do
+    local path = mp.command_native({ 'expand-path', '~~/script-opts/uosc.conf' })
+    local handle = path and io.open(path, 'r')
+    if handle then
+        for line in handle:lines() do
+            local key, value = line:match('^%s*([%w_]+)%s*=%s*(.-)%s*$')
+            local default = key and uosc_config[key]
+            if default ~= nil then
+                if type(default) == 'number' then
+                    uosc_config[key] = tonumber(value) or default
+                elseif type(default) == 'boolean' then
+                    uosc_config[key] = value == 'yes'
+                else
+                    uosc_config[key] = value
+                end
+            end
+        end
+        handle:close()
+    end
+end
+
+-- uosc's `color` override is a positional list; these are its documented slots.
+local COLOR_SLOTS = {
+    foreground = 1,
+    background = 3,
+    success = 6,
+    error = 7,
+    accent = 9,
+}
+
+local palette = {
+    foreground = 'ffffff',
+    background = '000000',
+    success = 'a5e075',
+    error = 'ff616e',
+    accent = '00adee',
+    dim = '9a9a9a',
+}
+
+do
+    local overrides = {}
+    for value in tostring(uosc_config.color or ''):gmatch('[^,]+') do
+        overrides[#overrides + 1] = value:gsub('^#', '')
+    end
+    for key, slot in pairs(COLOR_SLOTS) do
+        local hex = overrides[slot]
+        if hex and #hex == 6 then
+            palette[key] = hex
+        end
+    end
+end
+
+local function ui_scale()
+    if mp.get_property_native('fullscreen') or mp.get_property_native('maximized') then
+        return uosc_config.scale_fullscreen
+    end
+    return uosc_config.scale
+end
+
+-- The same formula uosc uses for its own menu items, so the card's type matches
+-- the menus and the top bar around it.
+local function card_font_size()
+    return math.floor(uosc_config.menu_item_height * ui_scale() * 0.48 * uosc_config.font_scale + 0.5)
+end
+
+-- ASS colours are &Hbbggrr&.
+local function bgr(hex)
+    hex = tostring(hex):gsub('#', '')
+    return hex:sub(5, 6) .. hex:sub(3, 4) .. hex:sub(1, 2)
+end
+
+-- Anchor to the configured corner, keeping clear of uosc's top bar when the card
+-- sits at the top.
+local function card_anchor(align)
+    local width, height = mp.get_osd_size()
+    if not width or not height or width <= 0 or height <= 0 then
+        return nil
+    end
+    local margin_x = mp.get_property_number('osd-margin-x') or 22
+    local margin_y = mp.get_property_number('osd-margin-y') or 22
+    if align == 1 then
+        return string.format('{\\pos(%.0f,%.0f)', margin_x, height - margin_y)
+    end
+    local y = margin_y + uosc_config.top_bar_size * ui_scale()
+    if align == 7 then
+        return string.format('{\\pos(%.0f,%.0f)', margin_x, y)
+    end
+    return string.format('{\\pos(%.0f,%.0f)', width - margin_x, y)
+end
+
+-- `lines` is a list of rows, each a list of { text, color, bold, size } spans.
+local function render_card(lines, align)
+    local scale = ui_scale()
+    local fs = card_font_size()
+
+    local tags = {}
+    local anchor = card_anchor(align)
+    if anchor then
+        table.insert(tags, anchor)
+    end
+
+    table.insert(tags, string.format('{\\an%d\\fs%d', align, fs))
+    local font = mp.get_property('options/osd-font')
+    if font and font ~= '' then
+        table.insert(tags, string.format('\\fn%s', font))
+    end
+    if uosc_config.font_bold then
+        table.insert(tags, '\\b1')
+    end
+    table.insert(tags, string.format('\\bord%.1f', uosc_config.text_border * scale))
+    table.insert(tags, '\\shad0')
+    -- uosc outlines text drawn on the video with its background colour.
+    table.insert(tags, string.format('\\3c&H%s&\\1c&H%s&}', bgr(palette.background), bgr(palette.foreground)))
+
+    for i, row in ipairs(lines) do
+        if i > 1 then
+            table.insert(tags, '\\N')
+        end
+        for _, span in ipairs(row) do
+            table.insert(tags, string.format('{\\1c&H%s&\\b%d\\fs%d}',
+                bgr(span.color or palette.foreground), span.bold and 1 or 0, span.size or fs))
+            table.insert(tags, span.text)
+        end
+    end
+
+    return table.concat(tags)
+end
+
+local function card_section(lines, title)
+    table.insert(lines, { { text = title, color = palette.dim, bold = true } })
+end
+
+-- `value` is rendered as a hint, the way uosc renders a menu item's hint.
+local function card_item(lines, key, text, value, value_color)
+    local row = {
+        { text = key, color = palette.accent, bold = true },
+        { text = '\\h ' .. text, color = palette.foreground },
+    }
+    if value then
+        row[3] = { text = '\\h ' .. value, color = value_color or palette.dim, size = card_font_size() - 1 }
+    end
+    table.insert(lines, row)
+end
+
+------------------------------------------------------------
 -- Menu interface
 --
 -- A Menu owns one ASS overlay, shared with its parent when it has one, and
@@ -520,9 +688,7 @@ function Menu:close()
 end
 
 function Menu:update()
-    local osd = OSD:new():config(config)
-    osd:append('Dummy menu.'):newline()
-    self:overlay_draw(osd:get_text())
+    self:overlay_draw(render_card({}, config.osd_align))
 end
 
 ------------------------------------------------------------
@@ -672,27 +838,35 @@ main_menu.open = function()
 end
 
 function main_menu:update()
-    local osd = OSD:new():config(config)
+    local lines = {}
+
     if encoder.alive == false then
-        osd:red("Error: "):append("mpv is not found in the PATH."):newline()
+        table.insert(lines, { { text = 'mpv is not found in the PATH.', color = palette.error, bold = true } })
+        card_section(lines, '')
     end
-    osd:submenu('Timings '):italics('(+shift use sub timings)'):newline()
-    osd:tab():item('s: '):append('start time '):item(h.human_readable_time(self.timings['start'])):newline()
-    osd:tab():item('e: '):append('end time '):item(h.human_readable_time(self.timings['end'])):newline()
-    osd:tab():item('r: '):append('reset'):newline()
-    osd:submenu('Create clip '):italics('(+shift to force fullHD preset)'):newline()
-    osd:tab():item('c: '):append('video clip'):newline()
-    osd:tab():item('a: '):append('audio clip'):newline()
-    osd:tab():item('f: '):append('screenshot'):newline()
-    osd:tab():item('x: '):append('video clip to ' .. fmt_upload_dest()):newline()
-    osd:submenu('Crop '):newline()
-    osd:tab():item('k: '):append('select crop zone (currently '):append(current_crop_text()):append(')'):newline()
-    osd:tab():item('d: '):append('clear crop'):newline()
-    osd:submenu('Options '):newline()
-    osd:tab():item('p: '):append('Open preferences'):newline()
-    osd:tab():item('o: '):append('Open streamable.com'):newline()
-    osd:tab():item('ESC: '):append('Close'):newline()
-    self:overlay_draw(osd:get_text())
+
+    card_section(lines, 'Timings')
+    card_item(lines, 's', 'start time', h.human_readable_time(self.timings['start']))
+    card_item(lines, 'e', 'end time', h.human_readable_time(self.timings['end']))
+    card_item(lines, 'r', 'reset')
+
+    card_section(lines, 'Create clip')
+    card_item(lines, 'c', 'video clip')
+    card_item(lines, 'C', 'video clip 1080p')
+    card_item(lines, 'a', 'audio clip')
+    card_item(lines, 'f', 'screenshot')
+    card_item(lines, 'x', 'video clip to', fmt_upload_dest())
+
+    card_section(lines, 'Crop')
+    card_item(lines, 'k', 'select crop zone', current_crop_text())
+    card_item(lines, 'd', 'clear crop')
+
+    card_section(lines, 'Options')
+    card_item(lines, 'p', 'preferences')
+    card_item(lines, 'o', 'open streamable.com')
+    card_item(lines, 'ESC', 'close')
+
+    self:overlay_draw(render_card(lines, config.osd_align))
 end
 
 ------------------------------------------------------------
@@ -872,26 +1046,29 @@ end
 function pref_menu:update()
     self:sync_from_config()
 
-    local osd = OSD:new():config(config)
-    osd:submenu('Preferences'):newline()
-    osd:tab():item('r: Video resolution: '):append(self:get_selected_resolution()):newline()
-    osd:tab():item('f: Video format: '):append(config.video_format):newline()
-    osd:tab():item('a: Audio format: '):append(config.audio_format):newline()
-    osd:tab():item('b: Video bitrate: '):append(config.video_bitrate):newline()
-    osd:tab():item('B: Audio bitrate: '):append(config.audio_bitrate):newline()
-    osd:tab():item('m: Mute audio: '):append(mp.get_property("mute")):newline()
-    osd:tab():item('e: Embed subtitles: '):append(mp.get_property("sub-visibility")):newline()
-    osd:submenu('Upload'):newline()
-    osd:tab():item('u: Destination: '):append(fmt_upload_dest()):newline()
+    local lines = {}
+    card_section(lines, 'Preferences')
+    card_item(lines, 'r', 'video resolution', self:get_selected_resolution())
+    card_item(lines, 'f', 'video format', config.video_format)
+    card_item(lines, 'a', 'audio format', config.audio_format)
+    card_item(lines, 'b', 'video bitrate', config.video_bitrate)
+    card_item(lines, 'B', 'audio bitrate', config.audio_bitrate)
+    card_item(lines, 'm', 'mute audio', mp.get_property("mute"))
+    card_item(lines, 'e', 'embed subtitles', mp.get_property("sub-visibility"))
+
+    card_section(lines, 'Upload')
+    card_item(lines, 'u', 'destination', fmt_upload_dest())
     if config.upload_dest == 'litterbox' then
-        osd:tab():item('z: Litterbox expires after: '):append(config.litterbox_expire):newline()
+        card_item(lines, 'z', 'litterbox expires after', config.litterbox_expire)
     else
-        osd:tab():color("b0b0b0"):text('z: Litterbox expires after: '):append('N/A'):newline()
+        card_item(lines, 'z', 'litterbox expires after', 'N/A')
     end
-    osd:submenu('Save'):newline()
-    osd:tab():item('s: Save preferences'):newline()
-    osd:tab():item('ESC: Back to main menu'):newline()
-    self:overlay_draw(osd:get_text())
+
+    card_section(lines, 'Save')
+    card_item(lines, 's', 'save preferences')
+    card_item(lines, 'ESC', 'back')
+
+    self:overlay_draw(render_card(lines, config.osd_align))
 end
 
 ------------------------------------------------------------
