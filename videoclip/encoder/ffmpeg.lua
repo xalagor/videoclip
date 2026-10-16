@@ -112,6 +112,8 @@ local function make_ffmpeg_encoder(config, timings)
 
     function self.append_audio_reencode_args(args)
         --- Append audio re-encoding options matching the configured audio preferences.
+        table.insert(args, '-ac')
+        table.insert(args, '2')
         table.insert(args, '-c:a')
         table.insert(args, self.config.audio_codec)
         table.insert(args, '-b:a')
@@ -266,7 +268,7 @@ end
 -- Tests
 
 local VIDEO_OUTPUT_ARGS = { '-sn', '-dn', '-map_metadata', '-1', '-map_chapters', '-1' }
-local AUDIO_ENCODE_ARGS = { '-c:a', 'libopus', '-b:a', '32k', '-application', 'voip', '-compression_level', '10' }
+local AUDIO_ENCODE_ARGS = { '-ac', '2', '-c:a', 'libopus', '-b:a', '32k', '-application', 'voip', '-compression_level', '10' }
 
 local function expected_input(source_path)
     --- Return the ffmpeg input prefix shared by all expected arg lists.
