@@ -23,10 +23,14 @@ local mpopt = require('mp.options')
 local utils = require('mp.utils')
 local p = require('platform')
 local h = require('helpers')
-local encoder = require('encoder')
+local make_encoder = require('encoder.encoder')
 local Timings = require('timings_mgr')
+local cfg_mgr = require('config.config')
 local cropper = require('cropper')
 local anytype_upload = require('anytype_upload')
+
+local config = cfg_mgr.read_config_file()
+local encoder = make_encoder.new()
 
 ------------------------------------------------------------
 -- System-dependent variables
@@ -833,37 +837,11 @@ function pref_menu:cycle_litterbox_expirations()
 end
 
 function pref_menu:save()
-    local function lua_to_mpv(config_value)
-        if type(config_value) == 'boolean' then
-            return config_value and 'yes' or 'no'
-        else
-            return tostring(config_value)
-        end
-    end
-
-    local ignore_list = {
-        video_extension = true,
-        audio_extension = true,
-        video_codec = true,
-        audio_codec = true,
-        anytype_version = true,
-    }
-
-    local mpv_dirpath = string.gsub(mp.get_script_directory(), "scripts[\\/][^\\/]+", "")
-    local config_filepath = utils.join_path(utils.join_path(mpv_dirpath, "script-opts"), string.format('%s.conf', NAME))
-
-    local handle = io.open(config_filepath, 'w')
-    if handle ~= nil then
-        handle:write(string.format("# Written by %s on %s.\n", NAME, os.date()))
-        for key, value in pairs(config) do
-            if ignore_list[key] == nil then
-                handle:write(string.format('%s=%s\n', key, lua_to_mpv(value)))
-            end
-        end
-        handle:close()
-        h.notify("Settings saved.", "info", 2)
+    local result, err = cfg_mgr.save_config_file(config)
+    if h.is_empty(err) then
+        h.notify(result or "Settings saved.", "info", 2)
     else
-        h.notify_error(string.format("Couldn't open %s.", config_filepath), "error", 4)
+        h.notify_error(err, "error", 4)
     end
     self:update()
 end
@@ -899,10 +877,24 @@ end
 ------------------------------------------------------------
 -- Entry point
 
-validate_config()
-encoder.init(config, main_menu.timings)
-mp.add_key_binding('c', 'videoclip-menu-open', main_menu.open)
-mp.msg.warn("Press 'c' to open the videoclip menu.")
+local main = (function()
+    local main_executed = false
+    return function()
+        if main_executed then
+            main_menu.timings:reset()
+            return
+        else
+            main_executed = true
+        end
+
+        cfg_mgr.validate_config(config)
+        encoder.init(config, main_menu.timings)
+        mp.add_key_binding('c', 'videoclip-menu-open', main_menu.open)
+        mp.msg.warn("Press 'c' to open the videoclip menu.")
+    end
+end)()
+
+mp.register_event("file-loaded", main)
 
 mp.register_script_message("videoclip-screenshot", function(mode)
     mode = (mode and mode ~= "") and mode or "video"

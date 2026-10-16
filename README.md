@@ -41,13 +41,38 @@ To update the user-script on demand later, you can execute:
 cd ~/.config/mpv/scripts/videoclip && git pull
 ```
 
+### Using make
+
+Clone the repository first, then install to `~/.config/mpv` by running:
+
+``` bash
+git clone 'https://github.com/Ajatt-Tools/videoclip.git'
+cd videoclip
+make install
+```
+
+The installation target copies the `videoclip/` directory to `~/.config/mpv/scripts/`.
+If none exists, installs the example config to `~/.config/mpv/script-opts/videoclip.conf`.
+
+To uninstall, run:
+
+``` bash
+make uninstall
+```
+
+To install to a different mpv config directory, set `PREFIX`:
+
+``` bash
+make PREFIX="$HOME/.config/mpv" install
+```
+
 ### Manually
 
-Download
-[the repository](https://github.com/Ajatt-Tools/videoclip/archive/refs/heads/master.zip)
-and extract the folder containing
-`videoclip.lua`
-to your [mpv scripts](https://github.com/mpv-player/mpv/wiki/User-Scripts) directory:
+1) Download
+   [the latest release](https://github.com/Ajatt-Tools/videoclip/releases)
+   or [the master branch (trunk)](https://github.com/Ajatt-Tools/videoclip/archive/refs/heads/master.zip)
+2) Extract the `videoclip/` directory from the zip file
+   to your [mpv scripts](https://github.com/mpv-player/mpv/wiki/User-Scripts) directory.
 
 | OS | Location |
 | --- | --- |
@@ -86,77 +111,10 @@ The config file should be created by the user, if needed.
 If a parameter is not specified in the config file, the default value will be used.
 mpv doesn't tolerate spaces before and after `=`.
 
-Example configuration file:
-
-```
-# Absolute paths to the folders where generated clips will be placed.
-# `~` is supported, but environment variables (e.g. `$HOME`) are not supported due to mpv limitations.
-video_folder_path=~/Videos
-audio_folder_path=~/Music
-
-# Menu size
-font_size=24
-
-# OSD settings. Line alignment: https://aegisub.org/docs/3.2/ASS_Tags/#\an
-osd_align=7
-osd_outline=1.5
-
-# Clean filenames (remove special characters) (yes or no)
-clean_filename=yes
-
-# Video settings
-video_width=-2
-video_height=480
-video_bitrate=1M
-# Available video formats: mp4, vp9, vp8
-video_format=mp4
-# The range of the scale is 0–51, where 0 is lossless,
-# 23 is the default, and 51 is worst quality possible.
-# Insane values like 9999 still work but produce the worst quality.
-video_quality=23
-# Use the slowest preset that you have patience for.
-# https://trac.ffmpeg.org/wiki/Encode/H.264
-preset=faster
-# FPS / framerate. Set to "auto" or a number.
-video_fps=auto
-#video_fps=60
-
-# Audio settings
-# Available formats: opus or aac
-audio_format=opus
-# Opus sounds good at low bitrates 32-64k, but aac requires 128-256k.
-audio_bitrate=32k
-
-# Catbox.moe upload settings
-# Whether uploads should go to litterbox instead of catbox.
-# catbox files are stored permanently, while litterbox is temporary
-litterbox=yes
-# If using litterbox, time until video expires
-# Available values: 1h, 12h, 24h, 72h
-litterbox_expire=72h
-
-# Custom upload command (replaces catbox.moe)
-# Use %f as placeholder for the file path
-# Example for 0x0.st:
-# custom_upload_command=curl -F'file=@%f' https://0x0.st
-# You can also make a bash script and set custom_upload_command to `bash ~/path/to/upload.sh %f` to achieve more customizability.
-custom_upload_command=
-
-# Filename format
-# Available tags: %n = filename, %t = title, %s = start, %e = end, %d = duration,
-#                 %Y = year, %M = months, %D = day, %H = hours (24), %I = hours (12),
-#                 %P = am/pm %N = minutes, %S = seconds
-# Title will fallback to filename if it's not present
-#filename_template=%n_%s-%e(%d)
-filename_template=%n_%s-%e
-
-# Anytype upload settings
-upload_dest=anytype
-anytype_api_url=http://127.0.0.1:31009
-anytype_api_key=
-anytype_space_id=
-anytype_version=2025-11-08
-```
+The example configuration file is stored in
+[`videoclip/config/default_config.conf`](videoclip/config/default_config.conf).
+Release pages also provide it as `videoclip.conf`.
+Copy it to your `script-opts` directory and edit it as needed.
 
 ### Anytype Integration & Credentials
 
@@ -205,3 +163,18 @@ The default key binding is `m`.
 If a video has visible subtitles, they will be embedded automatically.
 Toggle them off in mpv if you don't want any subtitles to be visible.
 The default key binding is `v`.
+
+## Running tests
+
+Run tests without mpv or a media file:
+
+```bash
+lua tests/run.lua
+luajit tests/run.lua
+```
+
+Run tests inside a real mpv instance with a local media file:
+
+```bash
+VIDEOCLIP_TEST=TRUE mpv --msg-level=all=no,videoclip=warn "/path/to/video.mkv"
+```
