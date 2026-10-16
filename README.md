@@ -149,20 +149,48 @@ custom_upload_command=
 # Title will fallback to filename if it's not present
 #filename_template=%n_%s-%e(%d)
 filename_template=%n_%s-%e
+
+# Anytype upload settings
+upload_dest=anytype
+anytype_api_url=http://127.0.0.1:31009
+anytype_api_key=
+anytype_space_id=
+anytype_version=2025-11-08
 ```
+
+### Anytype Integration & Credentials
+
+- **Live Configuration**: In portable or Scoop installations of mpv, the live configuration file is at `<mpv_dir>/portable_config/script-opts/videoclip.conf` (e.g. `C:\Users\Xalagor\scoop\persist\mpv\portable_config\script-opts\videoclip.conf`). Any unread config at `%APPDATA%\mpv\script-opts\videoclip.conf` is ignored.
+- **Repository Junction**: The script directory (`…/portable_config/scripts/videoclip`) is deployed as a Windows directory junction pointing directly to the `mpv-videoclip` repository working tree (`C:\Projects\Arcanum\mpv-videoclip`), ensuring changes in the repo are loaded by mpv immediately.
+- **Credential Resolution**: API credentials prefer environment variables first:
+  - `ANYTYPE_API_KEY` (or `ANYTYPE_APP_KEY`): supplies the Anytype bearer API key.
+  - `ANYTYPE_SPACE_ID`: supplies the target space identifier.
+  - If unset in the environment, fallback values in `videoclip.conf` are used.
+- **Endpoint**: The endpoint is determined strictly by the `anytype_api_url` option (defaults to `http://127.0.0.1:31009`). The `ANYTYPE_API_URL` environment variable is intentionally not used.
 
 ### Key bindings
 
 | OS | Config location |
 | --- | --- |
 | GNU/Linux | `~/.config/mpv/input.conf` |
-| Windows | `C:/Users/Username/AppData/Roaming/mpv/input.conf` |
+| Windows | `C:/Users/Username/AppData/Roaming/mpv/input.conf` (or `portable_config/input.conf`) |
 
-Add this line if you want to change the key that opens the script's menu.
+Add this line if you want to change the key that opens the script's menu:
 
 ```
-c script-binding videoclip-menu-open
+c script-binding videoclip/videoclip-menu-open
 ```
+
+#### Anytype Screenshot Bindings
+
+The script provides a `videoclip-screenshot` script-message that captures a screenshot and uploads it directly to Anytype:
+
+```
+s       script-message videoclip-screenshot subtitles
+Shift+s script-message videoclip-screenshot video
+Ctrl+s  script-message videoclip-screenshot window
+```
+
 
 ## Usage
 

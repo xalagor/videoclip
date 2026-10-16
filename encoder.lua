@@ -289,7 +289,13 @@ this.create_clip = function(clip_type, on_complete)
     this.timings:reset()
 end
 
-this.extract_screenshot = function(on_complete)
+this.extract_screenshot = function(mode, on_complete)
+    if type(mode) == "function" then
+        on_complete = mode
+        mode = "video"
+    end
+    mode = (mode and mode ~= "") and mode or "video"
+
     local screenshot_filename_noext = construct_output_filename_noext()
     local output_path = utils.join_path(
         h.expand_path(this.config.video_folder_path),
@@ -307,7 +313,7 @@ this.extract_screenshot = function(on_complete)
     os.remove(output_path)
 
     -- Capture current frame to the specified file path
-    mp.commandv("screenshot-to-file", output_path, "video")
+    mp.commandv("screenshot-to-file", output_path, mode)
 
     -- Verify the file was created
     local file_info = utils.file_info(output_path)
@@ -320,6 +326,7 @@ this.extract_screenshot = function(on_complete)
         h.notify_error("Error: failed to capture screenshot.", "error", 5)
     end
 end
+
 
 this.get_youtube_url = function(time_pos)
     local path = mp.get_property("path", "")

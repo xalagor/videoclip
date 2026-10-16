@@ -26,6 +26,7 @@ local h = require('helpers')
 local encoder = require('encoder')
 local Timings = require('timings_mgr')
 local cropper = require('cropper')
+local anytype_upload = require('anytype_upload')
 
 ------------------------------------------------------------
 -- System-dependent variables
@@ -258,186 +259,9 @@ local function upload_to_custom(outfile)
     p.copy_or_open_url(url)
 end
 
-local function resolve_anytype_config()
-    local api_key = config.anytype_api_key
-    if not api_key or api_key == '' then
-        api_key = os.getenv("ANYTYPE_APP_KEY") or os.getenv("ANYTYPE_API_KEY") or ''
-    end
-    local space_id = config.anytype_space_id
-    if not space_id or space_id == '' then
-        space_id = os.getenv("ANYTYPE_SPACE_ID") or ''
-    end
-    return api_key, space_id
-end
-
-local function upload_to_anytype(file_path, source_url, content_from_id)
-    mp.msg.info(string.format(
-        "upload_to_anytype called: file_path=%s, source_url=%s, content_from_id=%s",
-        file_path, tostring(source_url), tostring(content_from_id)
-    ))
-
-    local api_key, space_id = resolve_anytype_config()
-    if api_key == '' or space_id == '' then
-        h.notify_error("Anytype config missing: set anytype_api_key and anytype_space_id", "error", 4)
-        return
-    end
-
-    h.notify("Uploading to Anytype via REST API...", "info", 9999)
-    local base_url = config.anytype_api_url:gsub("/+$", "")
-    local headers = {
-        "-H", "Authorization: Bearer " .. api_key,
-        "-H", "Anytype-Version: " .. config.anytype_version,
-    }
-
-    -- Step 1: Upload file to v2 API
-    local upload_url = string.format("%s/v2/spaces/%s/files", base_url, space_id)
-    local upload_cmd = {
-        p.curl_exe, "-s",
-        "-X", "POST",
-        upload_url,
-    }
-    for _, header in ipairs(headers) do
-        table.insert(upload_cmd, header)
-    end
-    table.insert(upload_cmd, "-F")
-    table.insert(upload_cmd, "file=@" .. file_path)
-
-    local upload_r = h.subprocess(upload_cmd)
-    if upload_r.status ~= 0 then
-        h.notify_error("Error: Anytype file upload failed. Status: " .. tostring(upload_r.status), "error", 4)
-        mp.msg.error("Anytype upload stderr: " .. (upload_r.stderr or ""))
-        return
-    end
-
-    local upload_out = upload_r.stdout
-    if not upload_out or upload_out == "" then
-        h.notify_error("Error: Anytype file upload returned empty response.", "error", 4)
-        return
-    end
-
-    local file_id = upload_out:match('"file_id"%s*:%s*"([^"]+)"')
-        or upload_out:match('"id"%s*:%s*"([^"]+)"')
-    if not file_id then
-        h.notify_error("Error: Anytype file upload returned invalid response.", "error", 4)
-        mp.msg.error("Anytype upload stdout: " .. upload_out)
-        return
-    end
-
-    mp.msg.info("Anytype file uploaded, file_id: " .. file_id)
-
-    -- Step 2: Create Bookmark object with v2 API
-    local objects_url = string.format("%s/v2/spaces/%s/objects", base_url, space_id)
-    local clip_name = h.clean_forbidden_characters(
-        mp.get_property("media-title", "clip")
-    )
-
-    local properties = {}
-    if source_url then
-        properties.source = source_url
-    end
-    if file_id then
-        properties.files = { file_id }
-    end
-
-    local obj_body = utils.format_json({
-        type = "Bookmark",
-        name = clip_name,
-        properties = properties,
-    })
-
-    local create_cmd = {
-        p.curl_exe, "-s",
-        "-X", "POST",
-        objects_url,
-    }
-    for _, header in ipairs(headers) do
-        table.insert(create_cmd, header)
-    end
-    table.insert(create_cmd, "-H")
-    table.insert(create_cmd, "Content-Type: application/json")
-    table.insert(create_cmd, "-d")
-    table.insert(create_cmd, obj_body)
-
-    local create_r = h.subprocess(create_cmd)
-    if create_r.status ~= 0 then
-        h.notify_error("Error: Anytype object creation failed. Status: " .. tostring(create_r.status), "error", 4)
-        mp.msg.error("Anytype object creation stderr: " .. (create_r.stderr or ""))
-        os.remove(file_path)
-        return
-    end
-
-    local create_out = create_r.stdout
-    if not create_out or create_out == "" then
-        h.notify_error("Error: Anytype object creation returned empty response.", "error", 4)
-        os.remove(file_path)
-        return
-    end
-
-    local object_id = create_out:match('"id"%s*:%s*"([^"]+)"')
-        or create_out:match('"object_id"%s*:%s*"([^"]+)"')
-    if not object_id then
-        h.notify_error("Error: Anytype object creation returned invalid response.", "error", 4)
-        mp.msg.error("Anytype object creation stdout: " .. create_out)
-        os.remove(file_path)
-        return
-    end
-
-    mp.msg.info("Anytype Bookmark object created, object_id: " .. object_id)
-
-    -- Step 3: Patch object with Content From relation if provided
-    if content_from_id then
-        local patch_url = string.format("%s/v2/spaces/%s/objects/%s", base_url, space_id, object_id)
-        local patch_body = utils.format_json({
-            ops = {
-                {
-                    op = "set_properties",
-                    set = {
-                        content_from = content_from_id,
-                    },
-                },
-            },
-        })
-
-        local patch_cmd = {
-            p.curl_exe, "-s",
-            "-X", "PATCH",
-            patch_url,
-        }
-        for _, header in ipairs(headers) do
-            table.insert(patch_cmd, header)
-        end
-        table.insert(patch_cmd, "-H")
-        table.insert(patch_cmd, "Content-Type: application/json")
-        table.insert(patch_cmd, "-d")
-        table.insert(patch_cmd, patch_body)
-
-        local patch_r = h.subprocess(patch_cmd)
-        if patch_r.status ~= 0 then
-            mp.msg.warn("Anytype object patch failed (content_from): " .. (patch_r.stderr or ""))
-        else
-            mp.msg.info("Anytype Bookmark patched with content_from: " .. content_from_id)
-        end
-    end
-
-    -- Copy link to clipboard
-    local link = string.format("anytype://object?objectId=%s&spaceId=%s", object_id, space_id)
-    local cb = p.clipboard.copy(link)
-    if cb.status ~= 0 then
-        h.notify("Uploaded to Anytype!\nFailed to copy link to clipboard.", "warn", 4)
-    else
-        h.notify("Uploaded to Anytype!\nLink copied to clipboard.", "info", 4)
-    end
-
-    -- Delete local file
-    local deleted, err = os.remove(file_path)
-    if not deleted then
-        mp.msg.error("Failed to delete local file: " .. (err or ""))
-    end
-end
-
 local function upload_video(outfile)
     if config.upload_dest == 'anytype' then
-        upload_to_anytype(outfile, nil, nil)
+        anytype_upload.upload_to_anytype(outfile, nil, nil)
     elseif config.upload_dest == 'custom' or config.custom_upload_command ~= '' then
         upload_to_custom(outfile)
     elseif config.upload_dest == 'catbox' then
@@ -455,7 +279,7 @@ end
 
 local function fmt_upload_dest()
     local upload_dest
-    if config.custom_upload_command ~= '' then
+    if config.upload_dest == 'custom' then
         upload_dest = 'custom upload'
     elseif config.upload_dest == 'anytype' then
         upload_dest = 'Anytype'
@@ -467,6 +291,7 @@ local function fmt_upload_dest()
 
     return upload_dest
 end
+
 
 ------------------------------------------------------------
 -- Card styling, matched to uosc
@@ -702,7 +527,7 @@ local function save_locally(_) end
 -- that used to supply it is disabled.
 local function upload_to_dest(file_path)
     if config.upload_dest == 'anytype' then
-        upload_to_anytype(file_path, encoder.get_youtube_url(), nil)
+        anytype_upload.upload_to_anytype(file_path, encoder.get_youtube_url(), nil)
     else
         upload_video(file_path)
     end
@@ -816,9 +641,9 @@ end
 
 function main_menu:take_screenshot()
     self:close()
-    encoder.extract_screenshot(function(file_path)
+    encoder.extract_screenshot("video", function(file_path)
         if config.upload_dest == 'anytype' then
-            upload_to_anytype(file_path, encoder.get_youtube_url(), nil)
+            anytype_upload.upload_to_anytype(file_path, encoder.get_youtube_url(), nil)
         end
     end)
 end
@@ -1078,4 +903,12 @@ validate_config()
 encoder.init(config, main_menu.timings)
 mp.add_key_binding('c', 'videoclip-menu-open', main_menu.open)
 mp.msg.warn("Press 'c' to open the videoclip menu.")
+
+mp.register_script_message("videoclip-screenshot", function(mode)
+    mode = (mode and mode ~= "") and mode or "video"
+    encoder.extract_screenshot(mode, function(file_path)
+        anytype_upload.upload_to_anytype(file_path, encoder.get_youtube_url(), nil)
+    end)
+end)
+
 
