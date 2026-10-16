@@ -181,8 +181,30 @@ this.query_user_home_dir = function()
 end
 
 this.clean_forbidden_characters = function(title)
-    return title:gsub('[<>:"/\\|%?%*]+', '.')
+    return title:gsub("[<>:\"/\\|%?%*']+", '.')
 end
+
+this.is_hdr_stream = function()
+    local params = mp.get_property_native("video-params")
+    local gamma = params and params["gamma"] or mp.get_property("video-params/gamma")
+    local primaries = params and params["primaries"] or mp.get_property("video-params/primaries")
+    local colormatrix = params and params["colormatrix"] or mp.get_property("video-params/colormatrix")
+
+    if gamma == "pq" or gamma == "hlg" or gamma == "smpte2084" or gamma == "arib-std-b67" then
+        return true
+    end
+
+    if primaries == "bt.2020" then
+        return true
+    end
+
+    if colormatrix == "bt.2020-ncl" or colormatrix == "bt.2020-cl" then
+        return true
+    end
+
+    return false
+end
+
 
 this.repr = function(value)
     --- Return a test-friendly string representation of a value.
@@ -278,11 +300,26 @@ this.run_tests = function()
 
     this.assert_equals(this.human_readable_time(-1), 'empty')
     this.assert_equals(this.human_readable_time(61.234), '01m01s234ms')
-    this.assert_equals(this.clean_forbidden_characters('a:b?c'), 'a.b.c')
+    this.assert_equals(this.clean_forbidden_characters("a:b?c'd"), 'a.b.c.d')
     this.assert_equals(this.repr({ a = 1 }), utils.format_json({ a = 1 }))
     this.assert_equals(this.repr({ a = 1 }), '{"a":1}')
     this.assert_equals(this.equal({ a = 1 }, { a = 1 }), true)
     this.assert_equals(this.truncate_utf8_bytes('abcdef', 3), 'abc')
+
+    if mp.set_property then
+        mp.set_property('video-params', { gamma = 'pq', primaries = 'bt.2020', colormatrix = 'bt.2020-ncl' })
+        this.assert_equals(this.is_hdr_stream(), true)
+
+        mp.set_property('video-params', { gamma = 'hlg', primaries = 'bt.2020', colormatrix = 'bt.2020-ncl' })
+        this.assert_equals(this.is_hdr_stream(), true)
+
+        mp.set_property('video-params', { gamma = 'bt.1886', primaries = 'bt.709', colormatrix = 'bt.709' })
+        this.assert_equals(this.is_hdr_stream(), false)
+
+        mp.set_property('video-params', nil)
+        this.assert_equals(this.is_hdr_stream(), false)
+    end
+
 
     local function greet(greeting, name)
         return greeting .. ", " .. name

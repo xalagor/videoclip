@@ -296,6 +296,20 @@ local function run_tests()
     h.assert_equals(clip_result_failed({ status = 1, stdout = '', stderr = 'error' }), true)
     h.assert_equals(clip_result_failed({ status = 0, stdout = 'could not open file', stderr = '' }), true)
     h.assert_equals(clip_result_failed({ status = 0, stdout = '', stderr = '' }), false)
+
+    if mp.set_property then
+        mp.set_property('path', 'https://youtu.be/dQw4w9WgXcQ')
+        h.assert_equals(test_encoder.get_youtube_url(10), 'https://youtu.be/dQw4w9WgXcQ?t=10.000')
+
+        mp.set_property('path', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+        h.assert_equals(test_encoder.get_youtube_url(5), 'https://youtu.be/dQw4w9WgXcQ?t=5.000')
+
+        mp.set_property('path', '/tmp/local_file.mkv')
+        h.assert_equals(test_encoder.get_youtube_url(5), nil)
+
+        mp.set_property('path', '/tmp/input.mkv')
+    end
+
 end
 
 return {

@@ -70,10 +70,30 @@ local function make_ffmpeg_encoder(config, timings)
         return args
     end
 
+    function self.is_hdr()
+        if self.config.hdr_to_sdr then
+            return true
+        end
+        if h.is_hdr_stream and h.is_hdr_stream() then
+            return true
+        end
+        return false
+    end
+
     function self.make_video_filters()
         --- Return a comma-separated string of video filters.
-        return table.concat(eutils.video_filter_chain(self.config), ',')
+        local filters = {}
+        if self.is_hdr() then
+            local nits = self.config.hdr_target_nits or 100
+            local algo = self.config.hdr_tonemap_algorithm or 'hable'
+            table.insert(filters, string.format('zscale=t=linear:npl=%s,tonemap=tonemap=%s:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv', nits, algo))
+        end
+        for _, filter in ipairs(eutils.video_filter_chain(self.config)) do
+            table.insert(filters, filter)
+        end
+        return table.concat(filters, ',')
     end
+
 
     function self.append_video_reencode_args(args)
         --- Append video re-encoding options matching the configured video preferences.
@@ -330,6 +350,22 @@ local function test_reencode_mode(source_path, video_map, audio_map)
             VIDEO_OUTPUT_ARGS,
             { '/tmp/out.mp4' }
     ))
+
+    -- Video, re-encode, HDR tone-mapping.
+    local hdr_backend = make_ffmpeg_encoder(
+            fixtures.make_config({ copy_streams = false, hdr_to_sdr = true }),
+            fixtures.make_timings()
+    )
+    local expected_hdr_vf = 'zscale=t=linear:npl=100,tonemap=tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,scale=-2:480,format=yuv420p'
+    h.assert_equals(hdr_backend.mkargs_video('/tmp/out.mp4'), fixtures.concat(
+            expected_input(source_path),
+            { '-map', video_map, '-map', audio_map },
+            AUDIO_ENCODE_ARGS,
+            { '-c:v', 'libx264', '-b:v', '1M', '-crf', '23', '-preset', 'faster', '-vf', expected_hdr_vf },
+            VIDEO_OUTPUT_ARGS,
+            { '/tmp/out.mp4' }
+    ))
+
 
     -- Audio, re-encode.
     h.assert_equals(reencode_backend.mkargs_audio('/tmp/out.opus'), fixtures.concat(
