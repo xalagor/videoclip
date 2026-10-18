@@ -126,6 +126,11 @@ Copy it to your `script-opts` directory and edit it as needed.
   - If unset in the environment, fallback values in `videoclip.conf` are used.
 - **Endpoint**: The endpoint is determined strictly by the `anytype_api_url` option (defaults to `http://127.0.0.1:31009`). The `ANYTYPE_API_URL` environment variable is intentionally not used.
 
+### Repository & Remotes
+
+- **Primary Remote & Branch**: Development takes place on the `main` branch of the fork (`https://github.com/xalagor/videoclip.git`), which is tracked as `origin/main`.
+- **Upstream Protection**: The original repository (`https://github.com/Ajatt-Tools/videoclip.git`) is configured as `upstream` for fetching only (`pushURL = no_push`) to prevent accidental pushes to upstream.
+
 ### Key bindings
 
 | OS | Config location |
